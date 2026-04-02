@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use crate::ast::{type_of, AstNode, Parameter};
+use crate::ast::{AstNode, Parameter};
 use crate::v_type::VType;
 use crate::vm::NativeFunction;
 
@@ -37,7 +37,8 @@ pub struct PrototypeFunction {
 pub struct StructPrototype {
     pub name: String,
     pub fields: Vec<(String, VType)>,
-    pub struct_type: VType
+    pub struct_type: VType,
+    pub generics: Vec<String>
 }
 
 #[derive(Debug, Clone)]
@@ -48,6 +49,95 @@ pub struct CompileCtx {
     pub structs: Vec<StructPrototype>,
     pub regs: RegAlloc,
     pub native_map: HashMap<String, usize>,
+    pub struct_instances: HashMap<String, usize>,
+}
+
+macro_rules! find_const_arm {
+    ($consts:expr, $variant:path, $val:expr) => {{
+        let v = $consts.iter().position(|x| matches!(x, $variant(e) if *e == $val));
+        v.map(|n| n as u32)
+    }};
+}
+
+fn substitute_type(ty: &VType, map: &HashMap<String, VType>) -> VType {
+    match ty {
+        VType::Generic(name) => {
+            map.get(name)
+                .unwrap_or_else(|| panic!("Unbound generic '{}'", name))
+                .clone()
+        }
+        VType::Struct(name, gens) => {
+            VType::Struct(
+                name.clone(),
+                gens.iter().map(|g| substitute_type(g, map)).collect()
+            )
+        }
+        VType::Array(inner) => {
+            VType::Array(Box::new(substitute_type(inner, map)))
+        }
+        other => other.clone()
+    }
+}
+
+fn instantiate_struct(
+    ctx: &mut CompileCtx,
+    base_name: &str,
+    generic_args: Vec<VType>
+) -> usize {
+    // Build unique key
+    let key = format!(
+        "{}<{}>",
+        base_name,
+        generic_args.iter()
+            .map(|g| format!("{:?}", g))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+
+    // Cache hit
+    if let Some(idx) = ctx.struct_instances.get(&key) {
+        return *idx;
+    }
+
+    // Find base prototype
+    let base = ctx.structs.iter()
+        .find(|s| s.name == base_name)
+        .unwrap_or_else(|| panic!("Unknown struct '{}'", base_name))
+        .clone();
+
+    if base.generics.len() != generic_args.len() {
+        panic!("Generic arity mismatch for '{}'", base_name);
+    }
+    if base.generics.len() > 0 && generic_args.is_empty() {
+        panic!("Generic struct '{}' requires type arguments", base_name);
+    }
+
+    // Build substitution map
+    let mut subst = HashMap::new();
+    for (g, arg) in base.generics.iter().zip(generic_args.iter()) {
+        subst.insert(g.clone(), arg.clone());
+    }
+
+    // Substitute fields
+    let fields = base.fields.iter()
+        .map(|(name, ty)| {
+            (name.clone(), substitute_type(ty, &subst))
+        })
+        .collect::<Vec<_>>();
+
+    let new_idx = ctx.structs.len() - 1;
+
+    let new_proto = StructPrototype {
+        name: key.clone(), // important: unique name
+        fields,
+        struct_type: VType::Struct(key.clone(), vec![]),
+        generics: vec![], // now concrete
+    };
+
+    ctx.structs.push(new_proto);
+    ctx.struct_instances.insert(key, new_idx);
+
+    new_idx
 }
 
 impl CompileCtx {
@@ -59,6 +149,7 @@ impl CompileCtx {
             structs: vec![],
             regs: RegAlloc::new(),
             native_map: HashMap::new(),
+            struct_instances: HashMap::new(),
         }
     }
 
@@ -70,6 +161,7 @@ impl CompileCtx {
             structs: (*parent.structs).to_vec(),
             regs: RegAlloc::new(),
             native_map: parent.native_map.clone(),
+            struct_instances: HashMap::new(),
         }
     }
 
@@ -81,113 +173,27 @@ impl CompileCtx {
 
     pub fn find_const(&mut self, val: ConstValue) -> Option<u32> {
         match val {
-            ConstValue::Function(idx) => {
+           ConstValue::Array(ref elem) => {
                 let v = self.consts.iter()
-                    .position(|x| {
-                        match x {
-                            ConstValue::Function(e) => {
-                                *e == idx
-                            }
-                            _ => false
-                        }
-                    });
-                if let Some(n) = v {Some(n as u32)} else {None}
+                    .position(|x| matches!(x, ConstValue::Array(e) if e == elem));
+                v.map(|n| n as u32)
             }
-            ConstValue::NativeFunction(idx) => {
-                let v = self.consts.iter()
-                    .position(|x| {
-                        match x {
-                            ConstValue::NativeFunction(e) => {
-                                *e == idx
-                            }
-                            _ => false
-                        }
-                    });
-                if let Some(n) = v {Some(n as u32)} else {None}
+            ConstValue::Function(idx) => find_const_arm!(self.consts, ConstValue::Function, idx),
+            ConstValue::NativeFunction(idx) => find_const_arm!(self.consts, ConstValue::NativeFunction, idx),
+            ConstValue::I32(i) => find_const_arm!(self.consts, ConstValue::I32, i),
+            ConstValue::USize(i) => find_const_arm!(self.consts, ConstValue::USize, i),
+            ConstValue::Str(ref i) => find_const_arm!(self.consts, ConstValue::Str, *i),
+            ConstValue::Struct(i) => find_const_arm!(self.consts, ConstValue::Struct, i),
+            ConstValue::StructInst(i, ty) => {
+                 let v = self.consts.iter().position(|x| matches!(x, ConstValue::StructInst(e, v) if *e == i && *v == ty));
+                v.map(|n| n as u32)
             }
-            ConstValue::I32(i) => {
-                let v = self.consts.iter()
-                    .position(|x| {
-                        match x {
-                            ConstValue::I32(e) => {
-                                *e == i
-                            }
-                            _ => false
-                        }
-                    });
-                if let Some(n) = v {Some(n as u32)} else {None}
-            }
-            ConstValue::USize(i) => {
-                let v = self.consts.iter()
-                    .position(|x| {
-                        match x {
-                            ConstValue::USize(e) => {
-                                *e == i
-                            }
-                            _ => false
-                        }
-                    });
-                if let Some(n) = v {Some(n as u32)} else {None}
-            }
-            ConstValue::Str(i) => {
-                let v = self.consts.iter()
-                    .position(|x| {
-                        match x {
-                            ConstValue::Str(e) => {
-                                *e == i
-                            }
-                            _ => false
-                        }
-                    });
-                if let Some(n) = v {Some(n as u32)} else {None}
-            }
-            ConstValue::Struct(i) => {
-                let v = self.consts.iter()
-                    .position(|x| {
-                        match x {
-                            ConstValue::Struct(e) => {
-                                *e == i
-                            }
-                            _ => false
-                        }
-                    });
-                if let Some(n) = v {Some(n as u32)} else {None}
-            }
-            ConstValue::Type(i) => {
-                let v = self.consts.iter()
-                    .position(|x| {
-                        match x {
-                            ConstValue::Type(e) => {
-                                *e == i
-                            }
-                            _ => false
-                        }
-                    });
-                if let Some(n) = v {Some(n as u32)} else {None}
-            }
+            ConstValue::Type(ref i) => find_const_arm!(self.consts, ConstValue::Type, *i),
+            ConstValue::Bool(i) => find_const_arm!(self.consts, ConstValue::Bool, i),
             ConstValue::Empty => {
-                let v = self.consts.iter()
-                    .position(|x| {
-                        match x {
-                            ConstValue::Empty => true,
-                            _ => false
-                        }
-                    });
-                if let Some(n) = v {Some(n as u32)} else {None}
+                self.consts.iter().position(|x| matches!(x, ConstValue::Empty)).map(|n| n as u32)
             }
-            ConstValue::Bool(i) => {
-                let v = self.consts.iter()
-                    .position(|x| {
-                        match x {
-                            ConstValue::Bool(e) => {
-                                *e == i
-                            }
-                            _ => false
-                        }
-                    });
-                if let Some(n) = v {Some(n as u32)} else {None}
-            }
-            other => panic!("unhandled find_const val: '{:?}'", other)
+            other => panic!("unhandled find_const val: '{:?}'", other),
         }
     }
 
@@ -244,8 +250,9 @@ pub enum ConstValue {
 
     Function(usize),
     NativeFunction(usize),
+    StructInst(usize, Vec<VType>), // (struct_idx, concrete_type)
     Struct(usize),
-    Array(usize, usize),
+    Array(Box<VType>),
     Type(VType),
 }
 
@@ -277,6 +284,7 @@ pub enum Opcode {
     NewArray,
     GetArrayIdx,
     SetArrayIdx,
+    ArrayLen,
 
     Jmp, // Will only jump to the ip if the value in register a is true
     Jn,
@@ -302,6 +310,9 @@ impl TryFrom<u32> for Opcode {
     
     fn try_from(value: u32) -> Result<Self, Self::Error> {
         match value {
+            x if x == Opcode::ArrayLen as u32 => Ok(Opcode::ArrayLen),
+            x if x == Opcode::GetArrayIdx as u32 => Ok(Opcode::GetArrayIdx),
+            x if x == Opcode::SetArrayIdx as u32 => Ok(Opcode::SetArrayIdx),
             x if x == Opcode::LoadConst as u32 => Ok(Opcode::LoadConst),
             x if x == Opcode::Move as u32 => Ok(Opcode::Move),
             x if x == Opcode::Call as u32 => Ok(Opcode::Call),
@@ -360,6 +371,146 @@ pub fn pack_i_abc(op: Opcode, a: u32, b: u32, c: u32) -> Instruction {
     | (c << C_SHIFT)
 }
 
+pub fn coerce_type(from: &VType, to: &VType, ctx: &mut CompileCtx, reg: u32, code: &mut Vec<Instruction>) {
+    match (from, to) {
+        // Identity — nothing to do
+        (a, b) if a == b => {}
+        (a, VType::Auto) => {
+            let type_const = ctx.find_or_add_const(ConstValue::Type(to.clone()));
+            code.push(pack_i_abx(Opcode::Cast, reg, type_const));
+        },
+
+        (VType::Generic(..), b) => {
+            let type_const = ctx.find_or_add_const(ConstValue::Type(to.clone()));
+            code.push(pack_i_abx(Opcode::Cast, reg, type_const));
+        },
+
+        // Numeric widening / narrowing — emit a Cast instruction
+        (VType::U8  | VType::I8  |
+         VType::U16 | VType::I16 |
+         VType::U32 | VType::I32 |
+         VType::F32 | VType::F64 |
+         VType::USize,
+         VType::U8  | VType::I8  |
+         VType::U16 | VType::I16 |
+         VType::U32 | VType::I32 |
+         VType::F32 | VType::F64 |
+         VType::USize) => {
+            let type_const = ctx.find_or_add_const(ConstValue::Type(to.clone()));
+            // Cast A Bx  →  R[A] = R[A] cast-to const[Bx]
+            code.push(pack_i_abx(Opcode::Cast, reg, type_const));
+        }
+
+        (VType::Array(from_elem), VType::Array(to_elem)) => {
+            if from_elem != to_elem {
+                let type_const = ctx.find_or_add_const(ConstValue::Type(to.clone()));
+                code.push(pack_i_abx(Opcode::Cast, reg, type_const));
+            }
+        }
+
+        // Incompatible types
+        (f, t) => panic!(
+            "Cannot coerce {:?} into {:?}: types are not compatible",
+            f, t
+        ),
+    }
+}
+
+fn type_of(ctx: &mut CompileCtx, node: AstNode) -> VType
+{
+    match node {
+        AstNode::Index { target, .. } => {
+            match type_of(ctx, *target) {
+                VType::Array(elem_type) => *elem_type,
+                other => panic!("Cannot index into non-array type: {:?}", other),
+            }
+        }
+        AstNode::String(..) => VType::String,
+        AstNode::Integer(..) => VType::I32,
+        AstNode::Call {callee, args, generics} => {
+            if let AstNode::Identifier(name) = *callee {
+                let proto_idx = ctx.find_fn_addr_by_name(name.as_str())
+                    .unwrap_or_else(|| {
+                        panic!("unknown symbol")
+                    });
+                let proto = &ctx.protos[proto_idx];
+                return proto.return_type.clone();
+            }
+            panic!("Identifier empty?");
+        }
+        AstNode::StructLiteral { name, generics, .. } => {
+            if !generics.is_empty() {
+                VType::Struct(name.clone(), generics.clone())
+            } else {
+                VType::Struct(name.clone(), vec![])
+            }
+        }
+        AstNode::ArrayLiteral {exprs} => {
+            let first_type = type_of(ctx, *exprs[0].clone());
+            let len = exprs.len();
+            if len > 1
+            {
+                for i in 1..len
+                {
+                    let this_type = type_of(ctx, *exprs[i].clone());
+                    if this_type != first_type {
+                        panic!("Array types were not all the same")
+                    }
+                }
+            }
+            VType::Array(Box::new(first_type))
+        }
+        AstNode::Identifier(name) => {
+            let sym = ctx.find_symbol(name.as_str())
+                .unwrap_or_else(|| {
+                    panic!("unknown symbol")
+                });
+            sym.ty.clone()
+        },
+        AstNode::BinaryOp {op, left, right} => {
+            match op.as_str() {
+                "." => {
+                    let left_ty = type_of(ctx, *left);
+
+                    match left_ty {
+                        VType::Struct(name, generics) => {
+                            // If it's a generic instance, resolve concrete struct
+                            let struct_name = if !generics.is_empty() {
+                                let idx = instantiate_struct(ctx, &name, generics.clone());
+                                ctx.structs[idx].name.clone()
+                            } else {
+                                name.clone()
+                            };
+
+                            let proto = ctx.structs.iter()
+                                .find(|s| s.name == struct_name)
+                                .unwrap_or_else(|| panic!("Unknown struct '{}'", struct_name));
+
+                            let field_name = match *right {
+                                AstNode::FieldKey(f) => f,
+                                AstNode::Identifier(f) => f,
+                                _ => panic!("Invalid field access RHS: {:?}", right),
+                            };
+
+                            let (_, field_ty) = proto.fields.iter()
+                                .find(|(fname, _)| fname == &field_name)
+                                .unwrap_or_else(|| {
+                                    panic!("Field '{}' not found in struct '{}'", field_name, struct_name)
+                                });
+
+                            field_ty.clone()
+                        }
+
+                        other => panic!("Cannot access field on non-struct type: {:?}", other),
+                    }
+                }
+                _ => panic!("Unhandled op: {}", op)
+            }
+        }
+        other => panic!("Unhandled ast::type_of case: {:#?}", other)
+    }
+}
+
 pub fn compile_expr(ast: AstNode, ctx: &mut CompileCtx, reg: u32) -> Vec<Instruction> {
     let mut code = vec![];
     
@@ -403,10 +554,23 @@ pub fn compile_expr(ast: AstNode, ctx: &mut CompileCtx, reg: u32) -> Vec<Instruc
                 }
             }
         }
+        AstNode::Index { target, index } => {
+            let arr_reg = ctx.regs.alloc();
+            let idx_reg = ctx.regs.alloc();
+
+            // Compile the array expression into arr_reg
+            code.extend(compile_expr(*target, ctx, arr_reg));
+            // Compile the index expression into idx_reg
+            code.extend(compile_expr(*index, ctx, idx_reg));
+
+            // R[reg] = arr_reg[idx_reg]
+            code.push(pack_i_abc(Opcode::GetArrayIdx, reg, arr_reg, idx_reg));
+        }
         AstNode::BinaryOp { op, left, right } => {
             let (lreg, rreg) = (ctx.regs.alloc(), ctx.regs.alloc());
 
             let mut negate_flag = false;
+            let mut swap_operands = false;
             let oper_code = match op.as_str() {
                 "+" => Opcode::Add,
                 "-" => Opcode::Sub,
@@ -419,19 +583,18 @@ pub fn compile_expr(ast: AstNode, ctx: &mut CompileCtx, reg: u32) -> Vec<Instruc
                 }
                 "<" => Opcode::Lt,
                 ">" => {
-                    negate_flag = true;
+                    swap_operands = true;
                     Opcode::Lt
                 }
                 "<=" => Opcode::Le,
                 ">=" => {
-                    negate_flag = true;
+                    swap_operands = true;
                     Opcode::Le
                 }
                 "<<" => Opcode::BLShift,
                 ">>" => Opcode::BRShift,
                 "|" => Opcode::BOr,
                 "&" => Opcode::BAnd,
-
                 "||" => Opcode::LOr,
                 "&&" => Opcode::LAnd,
                 
@@ -451,14 +614,19 @@ pub fn compile_expr(ast: AstNode, ctx: &mut CompileCtx, reg: u32) -> Vec<Instruc
                 other => panic!("unhandled operator: {}", other)
             };
             
-            code.extend(compile_expr(*left, ctx, lreg));
-            code.extend(compile_expr(*right, ctx, rreg));
+            if swap_operands {
+                code.extend(compile_expr(*right, ctx, lreg));
+                code.extend(compile_expr(*left, ctx, rreg));
+            } else {
+                code.extend(compile_expr(*left, ctx, lreg));
+                code.extend(compile_expr(*right, ctx, rreg));
+            }
             code.push(pack_i_abc(oper_code, reg, lreg, rreg));
             if negate_flag {
                 code.push(pack_i_abx(Opcode::LNot, reg, reg))
             }
         }
-        AstNode::Call { callee, args } => {
+        AstNode::Call { callee, args, generics } => {
             code.extend(compile_expr(*callee, ctx, reg));
 
             let mut arg_regs = vec![];
@@ -476,15 +644,17 @@ pub fn compile_expr(ast: AstNode, ctx: &mut CompileCtx, reg: u32) -> Vec<Instruc
             // Convention: CALL A Bx -> function in R[A], args in R[A+1 .. A+Bx], returns into R[A]
             code.push(pack_i_abx(Opcode::Call, reg, num_args));
         }
-        AstNode::StructLiteral { name, fields } => {
-             let struct_idx = ctx.structs.iter()
-                .position(|s| s.name == name)
-                .expect("Struct should exist");
-            let struct_const_idx = ctx.find_or_add_const(ConstValue::Struct(struct_idx));
+        AstNode::StructLiteral { name, fields, generics } => {
+            let struct_idx = if !generics.is_empty() {
+                instantiate_struct(ctx, &name, generics.clone())
+            } else {
+                ctx.structs.iter()
+                    .position(|s| s.name == name)
+                    .expect("Struct should exist")
+            };
+            let struct_const_idx = ctx.find_or_add_const(ConstValue::StructInst(struct_idx, generics));
 
-            let struct_proto = ctx.structs.iter()
-                .find(|s| s.name == name)
-                .unwrap_or_else(|| panic!("Unknown struct type: {}", name));
+            let struct_proto = &ctx.structs[struct_idx];
             
             code.push(pack_i_abx(Opcode::NewStruct, reg, struct_const_idx));
             
@@ -511,7 +681,50 @@ pub fn compile_expr(ast: AstNode, ctx: &mut CompileCtx, reg: u32) -> Vec<Instruc
             }
         }
         AstNode::ArrayLiteral { exprs } => {
+            if exprs.is_empty() {
+                panic!("Array literal must have at least one element (cannot infer element type from empty literal)");
+            }
 
+            // Infer element type from the first element; all others must match or be
+            // coercible to it.
+            let elem_type = type_of(ctx, *exprs[0].clone());
+            let len = exprs.len();
+
+            // Allocate registers for all elements up-front (mirrors the Call convention).
+            let mut elem_regs: Vec<u32> = (0..len).map(|_| ctx.regs.alloc()).collect();
+
+            // Emit a NewArray instruction: A = destination reg, Bx = const-pool index
+            // for an Array(elem_type, len) descriptor.
+            let array_type_const =
+                ctx.find_or_add_const(
+                    ConstValue::Array(
+                        Box::new(
+                            elem_type.clone()
+                        )
+                    )
+                );
+            code.push(pack_i_abx(Opcode::NewArray, reg, array_type_const));
+
+            for (i, expr) in exprs.into_iter().enumerate() {
+                let elem_reg  = elem_regs[i];
+                let expr_type = type_of(ctx, *expr.clone());
+
+                // Compile the element expression into its dedicated register.
+                code.extend(compile_expr(*expr, ctx, elem_reg));
+
+                // Coerce the element to the array's canonical element type if needed.
+                if expr_type != elem_type {
+                    let mut coerce_code = vec![];
+                    coerce_type(&expr_type, &elem_type, ctx, elem_reg, &mut coerce_code);
+                    code.extend(coerce_code);
+                }
+
+                // Emit the index constant and the SetArrayIdx instruction.
+                let idx_const = ctx.find_or_add_const(ConstValue::USize(i));
+                let idx_reg   = ctx.regs.alloc();
+                code.push(pack_i_abx(Opcode::LoadConst, idx_reg, idx_const));
+                code.push(pack_i_abc(Opcode::SetArrayIdx, reg, idx_reg, elem_reg));
+            }
         }
         other => panic!("unknown expr node: {:?}", other),
     }
@@ -521,7 +734,7 @@ pub fn compile_expr(ast: AstNode, ctx: &mut CompileCtx, reg: u32) -> Vec<Instruc
 
 fn resolve_field_access(node: &AstNode, ctx: &CompileCtx, struct_reg: &u32) -> usize {
     match node {
-        AstNode::Identifier(field_name) => {
+        AstNode::Identifier(field_name) | AstNode::FieldKey(field_name) => {
             //TODO: Needs proper typechecking
             for struct_proto in &ctx.structs {
                 if let Some(field_idx) = struct_proto.fields.iter()
@@ -550,6 +763,17 @@ pub fn compile_stmt(ast: AstNode, ctx: &mut CompileCtx, code: &mut Vec<Instructi
                         panic!("Undefined variable: {}", name);
                     }
                 }
+                AstNode::Index { target, index } => {
+                    let value_reg = ctx.regs.alloc();
+                    code.extend(compile_expr(*value, ctx, value_reg));
+
+                    let arr_reg = ctx.regs.alloc();
+                    let idx_reg = ctx.regs.alloc();
+                    code.extend(compile_expr(*target, ctx, arr_reg));
+                    code.extend(compile_expr(*index, ctx, idx_reg));
+
+                    code.push(pack_i_abc(Opcode::SetArrayIdx, arr_reg, idx_reg, value_reg));
+                }
                 AstNode::BinaryOp { op, left, right } if op == "." => {
                     let value_reg = ctx.regs.alloc();
                     code.extend(compile_expr(*value, ctx, value_reg));
@@ -577,21 +801,26 @@ pub fn compile_stmt(ast: AstNode, ctx: &mut CompileCtx, code: &mut Vec<Instructi
                 other =>  panic!("Invalid assignment target '{:?}' - only identifiers and index chains supported", other)
             }
         }
-
         AstNode::Declaration { name, value, v_type } => {
-            let t = type_of(*(value.clone()));
-            if t == v_type {
-                panic!("Expected {:?} for variable binding type, got {:?} as value type", v_type, t)
-            }
-            else if let AstNode::Identifier(name_str) = *name {
+            let t = type_of(ctx, *(value.clone()));
+            
+            if let AstNode::Identifier(name_str) = *name {
                 let reg = ctx.regs.alloc();
-                ctx.add_symbol(name_str, reg, v_type);
+                ctx.add_symbol(name_str.clone(), reg, v_type.clone());
                 code.extend(compile_expr(*value, ctx, reg));
+                
+                if t != v_type {
+                    // Attempt coercion — coerce_type will panic with a descriptive
+                    // message if the types are genuinely incompatible.
+                    coerce_type(&t, &v_type, ctx, reg, code);
+                }
+            } else {
+                panic!("Declaration: expected identifier as binding name, got {:?}", name);
             }
         }
 
-        AstNode::StructDecl { name, fields, struct_type } => {
-            let str_type = VType::Struct(name.clone());
+        AstNode::StructDecl { name, fields, struct_type , generics} => {
+            let str_type = VType::Struct(name.clone(), vec![]);
             let struct_idx = ctx.structs.len();
             let reg = ctx.regs.alloc();
             ctx.add_symbol(name.clone(), reg, str_type.clone());
@@ -607,7 +836,8 @@ pub fn compile_stmt(ast: AstNode, ctx: &mut CompileCtx, code: &mut Vec<Instructi
             let proto = StructPrototype {
                 name: name.clone(),
                 fields: actual_fields,
-                struct_type: str_type
+                struct_type: str_type,
+                generics
             };
             ctx.structs.push(proto)
         }
@@ -640,9 +870,9 @@ pub fn compile_stmt(ast: AstNode, ctx: &mut CompileCtx, code: &mut Vec<Instructi
             ctx.protos.push(proto);
         }
         
-        AstNode::Call { callee, args } => {
+        AstNode::Call { callee, args, generics } => {
             let temp_reg = ctx.regs.alloc();
-            code.extend(compile_expr(AstNode::Call { callee, args }, ctx, temp_reg));
+            code.extend(compile_expr(AstNode::Call { callee, args, generics }, ctx, temp_reg));
         }
         
         AstNode::Return { args } => {
@@ -698,6 +928,111 @@ pub fn compile_stmt(ast: AstNode, ctx: &mut CompileCtx, code: &mut Vec<Instructi
 
             let exit_idx = code.len() as u32;
             code[jmp_false_pos] = pack_i_abx(Opcode::Jn, cond_reg, exit_idx);
+        }
+        AstNode::ForLoop { iteratee, params, body } => {
+            let binding = &params[0];
+            let binding_name = binding.ident.clone();
+            let binding_type = binding.v_type.clone();
+
+            match *iteratee {
+                // Range iteration: for i: i32 in 0..10
+                AstNode::BinaryOp { op, left, right } if op == ".." => {
+                    let counter_reg = ctx.regs.alloc();
+                    let end_reg = ctx.regs.alloc();
+                    let cond_reg = ctx.regs.alloc();
+
+                    // Evaluate start and end once before the loop
+                    code.extend(compile_expr(*left, ctx, counter_reg));
+                    code.extend(compile_expr(*right, ctx, end_reg));
+
+                    // Register the binding as a symbol pointing at counter_reg
+                    ctx.add_symbol(binding_name.clone(), counter_reg, binding_type);
+
+                    // Loop start: condition check
+                    let loop_start = code.len();
+                    code.push(pack_i_abc(Opcode::Lt, cond_reg, counter_reg, end_reg));
+
+                    let jmp_false_pos = code.len();
+                    code.push(pack_i_abx(Opcode::Noop, 0, 0));
+
+                    code.push(pack_i_abx(Opcode::BeginBlock, 0, 0));
+                    for stmt in body {
+                        compile_stmt(*stmt, ctx, code);
+                    }
+
+                    // counter++
+                    let one_const = ctx.find_or_add_const(ConstValue::I32(1));
+                    let one_reg = ctx.regs.alloc();
+                    code.push(pack_i_abx(Opcode::LoadConst, one_reg, one_const));
+                    code.push(pack_i_abc(Opcode::Add, counter_reg, counter_reg, one_reg));
+
+                    code.push(pack_i_abx(Opcode::EndBlock, 0, 0));
+
+                    // Unconditional jump back to condition
+                    let true_const = ctx.find_or_add_const(ConstValue::Bool(true));
+                    let always_reg = ctx.regs.alloc();
+                    code.push(pack_i_abx(Opcode::LoadConst, always_reg, true_const));
+                    code.push(pack_i_abx(Opcode::Jmp, always_reg, loop_start as u32));
+
+                    let exit_idx = code.len() as u32;
+                    code[jmp_false_pos] = pack_i_abx(Opcode::Jn, cond_reg, exit_idx);
+                }
+
+                // Array iteration: for item: u8 in my_array
+                iteratee_node => {
+                    let arr_reg = ctx.regs.alloc();
+                    let counter_reg = ctx.regs.alloc();
+                    let len_reg = ctx.regs.alloc();
+                    let cond_reg = ctx.regs.alloc();
+                    let binding_reg = ctx.regs.alloc();
+
+                    // Evaluate the array expression once
+                    code.extend(compile_expr(iteratee_node, ctx, arr_reg));
+
+                    // Load length from the array pointer
+                    code.push(pack_i_abx(Opcode::ArrayLen, arr_reg, len_reg));
+
+                    // i = 0
+                    let zero_const = ctx.find_or_add_const(ConstValue::USize(0));
+                    code.push(pack_i_abx(Opcode::LoadConst, counter_reg, zero_const));
+
+                    // Register the binding symbol
+                    ctx.add_symbol(binding_name.clone(), binding_reg, binding_type);
+
+                    // Loop start: i < len
+                    let loop_start = code.len();
+                    code.push(pack_i_abc(Opcode::Lt, cond_reg, counter_reg, len_reg));
+
+                    let jmp_false_pos = code.len();
+                    code.push(pack_i_abx(Opcode::Noop, 0, 0));
+
+                    code.push(pack_i_abx(Opcode::BeginBlock, 0, 0));
+
+                    // binding = array[i]
+                    code.push(pack_i_abc(Opcode::GetArrayIdx, binding_reg, arr_reg, counter_reg));
+
+                    for stmt in body {
+                        compile_stmt(*stmt, ctx, code);
+                    }
+
+                    // i++
+                    let one_const = ctx.find_or_add_const(ConstValue::USize(1));
+                    let one_reg = ctx.regs.alloc();
+                    code.push(pack_i_abx(Opcode::LoadConst, one_reg, one_const));
+                    code.push(pack_i_abc(Opcode::Add, counter_reg, counter_reg, one_reg));
+
+                    code.push(pack_i_abx(Opcode::EndBlock, 0, 0));
+
+                    // Unconditional jump back to condition
+                    let true_const = ctx.find_or_add_const(ConstValue::Bool(true));
+                    let always_reg = ctx.regs.alloc();
+                    code.push(pack_i_abx(Opcode::LoadConst, always_reg, true_const));
+                    code.push(pack_i_abx(Opcode::Jmp, always_reg, loop_start as u32));
+
+                    let exit_idx = code.len() as u32;
+                    code[jmp_false_pos] = pack_i_abx(Opcode::Jn, cond_reg, exit_idx);
+                }
+            }
         }
         AstNode::ConditionalBranch { condition, body, next } => {
             match condition {

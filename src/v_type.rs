@@ -1,5 +1,5 @@
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum VType {
     U8,
     I8,
@@ -14,71 +14,57 @@ pub enum VType {
     Empty,
     Bool,
     String,
-    Struct(String),
+    Struct(String, Vec<VType>), // Proto name, instantiated generics
     Function,
+    Generic(String), // name
     Ref(
         Box<VType>
     ),
     Array(
         Box<VType>,
-        usize
     ),
+    Auto
 }
 
 pub fn is_vtype(name: &str) -> bool {
     matches!(name,
-    |   "U8"
-    |   "I8"
-    |   "U16"
-    |   "I16"
-    |   "I32"
-    |   "U32"
-    |   "F32"
-    |   "F64"
-    |   "Empty"
-    |   "Func"
-    |   "Bool"
-    |   "String"
-    |   "USize"
-    |   "Int"
-    |   "Array"
+    |   "u8"
+    |   "i8"
+    |   "u16"
+    |   "i16"
+    |   "i32"
+    |   "u32"
+    |   "f32"
+    |   "f64"
+    |   "empty"
+    |   "function"
+    |   "boolean"
+    |   "string"
+    |   "usize"
+    |   "int"
+    |   "array"
+    |   "auto"
     )
 }
 
-pub fn vty_from_str(name: &str, a: Option<&str>, b: Option<&str>) -> Result<VType, String> {
+pub fn vty_from_str(name: &str) -> Result<VType, String> {
     match name {
-        "U8" => Ok(VType::U8),
-        "I8" => Ok(VType::I8),
-        "U16" => Ok(VType::U16),
-        "I16" => Ok(VType::I16),
-        "I32" => Ok(VType::I32),
-        "U32" => Ok(VType::U32),
-        "F32" => Ok(VType::F32),
-        "F64" => Ok(VType::F64),
-        "Empty" => Ok(VType::Empty),
-        "Func" => Ok(VType::Func),
-        "Bool" => Ok(VType::Bool),
-        "String" => Ok(VType::String),
-        "USize" => Ok(VType::USize),
-        "Int" => Ok(VType::I32),
-        "Array" => {
-            if let Some(arg_a) = a {
-                if let Some(arg_b) = b {
-                    return Ok(
-                        VType::Array(
-                            Box::new(
-                                vty_from_str(arg_a, None, None).unwrap()
-                            ),
-                            str::parse::<usize>(arg_b).unwrap()
-                        )
-                    )
-                }
-            }
-            Ok(VType::Array(
-                Box::new(VType::Empty),
-                0
-            ))
-        }
+        "u8" => Ok(VType::U8),
+        "i8" => Ok(VType::I8),
+        "u16" => Ok(VType::U16),
+        "i16" => Ok(VType::I16),
+        "i32" => Ok(VType::I32),
+        "u32" => Ok(VType::U32),
+        "f32" => Ok(VType::F32),
+        "f64" => Ok(VType::F64),
+        "empty" => Ok(VType::Empty),
+        "function" => Ok(VType::Func),
+        "boolean" => Ok(VType::Bool),
+        "string" => Ok(VType::String),
+        "usize" => Ok(VType::USize),
+        "int" => Ok(VType::I32),
+        "array" => Ok(VType::Array(Box::new(VType::Empty))),
+        "auto" => Ok(VType::Auto),
         _ => Err("invalid enum name".to_string())
     }
 }
@@ -93,19 +79,28 @@ pub fn sizeof(v: VType) -> usize {
     }
 }
 
-// pub fn type_of(v: Value) -> VType {
-//     match v {
-//         Value::Byte(..) => VType::I8,
-//         Value::UByte(..) => VType::U8,
-//         Value::Short(..) => VType::I16,
-//         Value::UShort(..) => VType::U16,
-//         Value::Int(..) => VType::I32,
-//         Value::UInt(..) => VType::U32,
-//         Value::Float(..) => VType::F32,
-//         Value::Double(..) => VType::F64,
-//         Value::Str(..) => VType::I8,
-//         Value::Empty => VType::Empty,
-//         Value::Bool(..) => VType::Bool,
-//         _ => panic!("cannot get type of '{:?}'", v)
-//     }
-// }
+impl PartialEq for VType {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (VType::Array(a_ty), VType::Array(b_ty)) => a_ty == b_ty,
+            (VType::Ref(a), VType::Ref(b)) => a == b,
+            (VType::Struct(a, generics_a), VType::Struct(b, generics_b))
+                => a == b && generics_a == generics_b,
+            (VType::U8, VType::U8) => true,
+            (VType::I8, VType::I8) => true,
+            (VType::U16, VType::U16) => true,
+            (VType::I16, VType::I16) => true,
+            (VType::U32, VType::U32) => true,
+            (VType::I32, VType::I32) => true,
+            (VType::F32, VType::F32) => true,
+            (VType::F64, VType::F64) => true,
+            (VType::USize, VType::USize) => true,
+            (VType::Func, VType::Func) => true,
+            (VType::Empty, VType::Empty) => true,
+            (VType::Bool, VType::Bool) => true,
+            (VType::String, VType::String) => true,
+            (VType::Function, VType::Function) => true,
+            _ => false,
+        }
+    }
+}

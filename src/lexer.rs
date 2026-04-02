@@ -32,6 +32,7 @@ pub enum Token<'a> {
     IF,
     ELSE,
     ELSEIF,
+    IN,
 
     WHILE,
     FOR,
@@ -45,7 +46,7 @@ fn keywords() -> &'static HashMap<&'static str, Token<'static>> {
     KEYWORDS.get_or_init(|| {
         let mut map = HashMap::new();
         map.insert("let", Token::DECLARE);
-        map.insert("fn", Token::FN);
+        map.insert("function", Token::FN);
         map.insert("return", Token::RETURN);
         map.insert("struct", Token::STRUCT);
         map.insert("if", Token::IF);
@@ -55,6 +56,7 @@ fn keywords() -> &'static HashMap<&'static str, Token<'static>> {
         map.insert("for", Token::FOR);
         map.insert("do", Token::DO);
         map.insert("end", Token::END);
+        map.insert("in", Token::IN);
         map
     })
 }
@@ -243,7 +245,16 @@ pub fn tokenize(src: String) -> Vec<Token<'static>> {
                     tokens.push(Token::BINOP("%"));
                 }
             }
-            '.' => tokens.push(Token::BINOP(".")),
+            '.' => {
+                if chars.peek().map_or(false, |c| c == &'.') {
+                    tokens.push(Token::BINOP(".."));
+                    chars.next();
+                    continue;
+                }
+                else {
+                    tokens.push(Token::PUNCT("."))
+                }
+            },
             
             ',' => tokens.push(Token::PUNCT(",")),
             ':' => {
@@ -272,19 +283,22 @@ pub fn tokenize(src: String) -> Vec<Token<'static>> {
             ')' => tokens.push(Token::PAREN(")")),
             '{' => tokens.push(Token::PAREN("{")),
             '}' => tokens.push(Token::PAREN("}")),
+            '[' => tokens.push(Token::PAREN("[")),
+            ']' => tokens.push(Token::PAREN("]")),
 
             '<' => {
-                if chars.peek().map_or(false, |c| c == &'<') {
-                    chars.next();
-                    if chars.peek().map_or(false, |c| c == &'=') {
-                        tokens.push(Token::BINOP("<<="));
-                        chars.next();
-                    } else {
-                        tokens.push(Token::BINOP("<<"));
-                    }
-                    continue;
-                }
-                else if chars.peek().map_or(false, |c| c == &'=') {
+                // if chars.peek().map_or(false, |c| c == &'<') {
+                //     chars.next();
+                //     if chars.peek().map_or(false, |c| c == &'=') {
+                //         tokens.push(Token::BINOP("<<="));
+                //         chars.next();
+                //     } else {
+                //         tokens.push(Token::BINOP("<<"));
+                //     }
+                //     continue;
+                // }
+                // else
+                if chars.peek().map_or(false, |c| c == &'=') {
                     tokens.push(Token::BINOP("<="));
                     chars.next();
                     continue;
@@ -294,17 +308,18 @@ pub fn tokenize(src: String) -> Vec<Token<'static>> {
                 }
             }
             '>' => {
-                if chars.peek().map_or(false, |c| c == &'>') {
-                    chars.next();
-                    if chars.peek().map_or(false, |c| c == &'=') {
-                        tokens.push(Token::BINOP(">>="));
-                        chars.next();
-                    } else {
-                        tokens.push(Token::BINOP(">>"));
-                    }
-                    continue;
-                }
-                else if chars.peek().map_or(false, |c| c == &'=') {
+                // if chars.peek().map_or(false, |c| c == &'>') {
+                //     chars.next();
+                //     if chars.peek().map_or(false, |c| c == &'=') {
+                //         tokens.push(Token::BINOP(">>="));
+                //         chars.next();
+                //     } else {
+                //         tokens.push(Token::BINOP(">>"));
+                //     }
+                //     continue;
+                // }
+                // else
+                if chars.peek().map_or(false, |c| c == &'=') {
                     tokens.push(Token::BINOP(">="));
                     chars.next();
                     continue;

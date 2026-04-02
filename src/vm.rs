@@ -1,6 +1,12 @@
-use crate::compiler::{ConstValue, Instruction, Opcode, PrototypeFunction, StructPrototype, A_SHIFT, B_SHIFT, C_SHIFT, OPCODE_BITS};
+use crate::compiler::{coerce_type, ConstValue, Instruction, Opcode, PrototypeFunction, StructPrototype, A_SHIFT, B_SHIFT, C_SHIFT, OPCODE_BITS};
 use crate::compiler::ConstValue as CV;
 use crate::VType;
+
+#[derive(Debug, Clone)]
+pub enum StackSlot {
+    Struct(StructInstance),
+    Array(Vec<RuntimeValue>),
+}
 
 #[derive(Debug, Clone)]
 pub enum RuntimeValue {
@@ -24,6 +30,7 @@ pub enum RuntimeValue {
 
     Function(usize),
     Struct(usize),
+    Array(Vec<RuntimeValue>),
     NativeFunction(usize),
 
     Empty,
@@ -32,6 +39,7 @@ pub enum RuntimeValue {
 #[derive(Debug, Clone)]
 pub struct StructInstance {
     struct_idx: usize,
+    concrete_type: Vec<VType>, // 🔥 THIS
     fields: Vec<RuntimeValue>,
 }
 
@@ -51,6 +59,135 @@ pub struct CallFrame {
     local_var_bases: Vec<usize>,
 }
 
+fn resolve_type(ty: &VType, concrete: &[VType], generic_names: &[String]) -> VType {
+    match ty {
+        VType::Generic(name) => {
+            let idx = generic_names.iter()
+                .position(|g| g == name)
+                .expect("Generic not found in struct");
+
+            concrete.get(idx)
+                .cloned()
+                .expect("Missing concrete generic type")
+        }
+        _ => ty.clone()
+    }
+}
+
+macro_rules! apply_binop {
+    ($left:expr, $right:expr, $op:tt) => {
+        match ($left, $right) {
+            (RuntimeValue::I32(l),   RuntimeValue::I32(r))   => RuntimeValue::I32(l $op r),
+            (RuntimeValue::U32(l),   RuntimeValue::U32(r))   => RuntimeValue::U32(l $op r),
+            (RuntimeValue::I8(l),    RuntimeValue::I8(r))    => RuntimeValue::I8(l $op r),
+            (RuntimeValue::U8(l),    RuntimeValue::U8(r))    => RuntimeValue::U8(l $op r),
+            (RuntimeValue::I16(l),   RuntimeValue::I16(r))   => RuntimeValue::I16(l $op r),
+            (RuntimeValue::U16(l),   RuntimeValue::U16(r))   => RuntimeValue::U16(l $op r),
+            (RuntimeValue::USize(l), RuntimeValue::USize(r)) => RuntimeValue::USize(l $op r),
+            (RuntimeValue::F32(l),   RuntimeValue::F32(r))   => RuntimeValue::F32(l $op r),
+            (RuntimeValue::F64(l),   RuntimeValue::F64(r))   => RuntimeValue::F64(l $op r),
+            (l, r) => panic!("Binary operation applied to incompatible operands: {:?} {:?}", l, r),
+        }
+    };
+}
+
+fn cast_runtime_value(val: RuntimeValue, to: &VType) -> RuntimeValue {
+    match (val, to) {
+        (v, VType::Auto) => v,
+        // ── identity ──────────────────────────────────────────────────────────
+        (RuntimeValue::I32(n),  VType::I32)   => RuntimeValue::I32(n),
+        (RuntimeValue::U8(n),   VType::U8)    => RuntimeValue::U8(n),
+        (RuntimeValue::I8(n),   VType::I8)    => RuntimeValue::I8(n),
+        (RuntimeValue::U16(n),  VType::U16)   => RuntimeValue::U16(n),
+        (RuntimeValue::I16(n),  VType::I16)   => RuntimeValue::I16(n),
+        (RuntimeValue::U32(n),  VType::U32)   => RuntimeValue::U32(n),
+        (RuntimeValue::F32(n),  VType::F32)   => RuntimeValue::F32(n),
+        (RuntimeValue::F64(n),  VType::F64)   => RuntimeValue::F64(n),
+        (RuntimeValue::USize(n),VType::USize) => RuntimeValue::USize(n),
+
+        // ── unsigned widening / narrowing ─────────────────────────────────────
+        (RuntimeValue::U8(n),  VType::U16)  => RuntimeValue::U16(n as u16),
+        (RuntimeValue::U8(n),  VType::U32)  => RuntimeValue::U32(n as u32),
+        (RuntimeValue::U8(n),  VType::I32)  => RuntimeValue::I32(n as i32),
+        (RuntimeValue::U8(n),  VType::I16)  => RuntimeValue::I16(n as i16),
+        (RuntimeValue::U8(n),  VType::USize)=> RuntimeValue::USize(n as usize),
+        (RuntimeValue::U8(n),  VType::F32)  => RuntimeValue::F32(n as f32),
+        (RuntimeValue::U8(n),  VType::F64)  => RuntimeValue::F64(n as f64),
+
+        (RuntimeValue::U16(n), VType::U32)  => RuntimeValue::U32(n as u32),
+        (RuntimeValue::U16(n), VType::I32)  => RuntimeValue::I32(n as i32),
+        (RuntimeValue::U16(n), VType::USize)=> RuntimeValue::USize(n as usize),
+        (RuntimeValue::U16(n), VType::F32)  => RuntimeValue::F32(n as f32),
+        (RuntimeValue::U16(n), VType::F64)  => RuntimeValue::F64(n as f64),
+        (RuntimeValue::U16(n), VType::U8)   => RuntimeValue::U8(n as u8),   // narrowing
+        (RuntimeValue::U16(n), VType::I16)  => RuntimeValue::I16(n as i16),
+
+        (RuntimeValue::U32(n), VType::USize)=> RuntimeValue::USize(n as usize),
+        (RuntimeValue::U32(n), VType::F32)  => RuntimeValue::F32(n as f32),
+        (RuntimeValue::U32(n), VType::F64)  => RuntimeValue::F64(n as f64),
+        (RuntimeValue::U32(n), VType::I32)  => RuntimeValue::I32(n as i32),
+        (RuntimeValue::U32(n), VType::U8)   => RuntimeValue::U8(n as u8),
+        (RuntimeValue::U32(n), VType::U16)  => RuntimeValue::U16(n as u16),
+        (RuntimeValue::U32(n), VType::I16)  => RuntimeValue::I16(n as i16),
+
+        // ── signed widening / narrowing ───────────────────────────────────────
+        (RuntimeValue::I8(n),  VType::I16)  => RuntimeValue::I16(n as i16),
+        (RuntimeValue::I8(n),  VType::I32)  => RuntimeValue::I32(n as i32),
+        (RuntimeValue::I8(n),  VType::F32)  => RuntimeValue::F32(n as f32),
+        (RuntimeValue::I8(n),  VType::F64)  => RuntimeValue::F64(n as f64),
+        (RuntimeValue::I8(n),  VType::U8)   => RuntimeValue::U8(n as u8),
+        (RuntimeValue::I8(n),  VType::U16)  => RuntimeValue::U16(n as u16),
+        (RuntimeValue::I8(n),  VType::U32)  => RuntimeValue::U32(n as u32),
+
+        (RuntimeValue::I16(n), VType::I32)  => RuntimeValue::I32(n as i32),
+        (RuntimeValue::I16(n), VType::F32)  => RuntimeValue::F32(n as f32),
+        (RuntimeValue::I16(n), VType::F64)  => RuntimeValue::F64(n as f64),
+        (RuntimeValue::I16(n), VType::U8)   => RuntimeValue::U8(n as u8),
+        (RuntimeValue::I16(n), VType::U16)  => RuntimeValue::U16(n as u16),
+        (RuntimeValue::I16(n), VType::U32)  => RuntimeValue::U32(n as u32),
+        (RuntimeValue::I16(n), VType::I8)   => RuntimeValue::I8(n as i8),
+
+        (RuntimeValue::I32(n), VType::I8)   => RuntimeValue::I8(n as i8),
+        (RuntimeValue::I32(n), VType::I16)  => RuntimeValue::I16(n as i16),
+        (RuntimeValue::I32(n), VType::U8)   => RuntimeValue::U8(n as u8),
+        (RuntimeValue::I32(n), VType::U16)  => RuntimeValue::U16(n as u16),
+        (RuntimeValue::I32(n), VType::U32)  => RuntimeValue::U32(n as u32),
+        (RuntimeValue::I32(n), VType::F32)  => RuntimeValue::F32(n as f32),
+        (RuntimeValue::I32(n), VType::F64)  => RuntimeValue::F64(n as f64),
+        (RuntimeValue::I32(n), VType::USize)=> RuntimeValue::USize(n as usize),
+
+        // ── float conversions ─────────────────────────────────────────────────
+        (RuntimeValue::F32(n), VType::F64)  => RuntimeValue::F64(n as f64),
+        (RuntimeValue::F32(n), VType::I32)  => RuntimeValue::I32(n as i32),
+        (RuntimeValue::F32(n), VType::U32)  => RuntimeValue::U32(n as u32),
+        (RuntimeValue::F32(n), VType::I8)   => RuntimeValue::I8(n as i8),
+        (RuntimeValue::F32(n), VType::U8)   => RuntimeValue::U8(n as u8),
+        (RuntimeValue::F32(n), VType::USize)=> RuntimeValue::USize(n as usize),
+
+        (RuntimeValue::F64(n), VType::F32)  => RuntimeValue::F32(n as f32),
+        (RuntimeValue::F64(n), VType::I32)  => RuntimeValue::I32(n as i32),
+        (RuntimeValue::F64(n), VType::U32)  => RuntimeValue::U32(n as u32),
+        (RuntimeValue::F64(n), VType::I8)   => RuntimeValue::I8(n as i8),
+        (RuntimeValue::F64(n), VType::U8)   => RuntimeValue::U8(n as u8),
+        (RuntimeValue::F64(n), VType::USize)=> RuntimeValue::USize(n as usize),
+
+        // ── usize ─────────────────────────────────────────────────────────────
+        (RuntimeValue::USize(n), VType::I32)  => RuntimeValue::I32(n as i32),
+        (RuntimeValue::USize(n), VType::U32)  => RuntimeValue::U32(n as u32),
+        (RuntimeValue::USize(n), VType::U8)   => RuntimeValue::U8(n as u8),
+        (RuntimeValue::USize(n), VType::U16)  => RuntimeValue::U16(n as u16),
+        (RuntimeValue::USize(n), VType::F32)  => RuntimeValue::F32(n as f32),
+        (RuntimeValue::USize(n), VType::F64)  => RuntimeValue::F64(n as f64),
+
+        (RuntimeValue::Str(v), VType::String) => RuntimeValue::Str(v),
+        
+        (src, target) => panic!(
+            "cast_runtime_value: no cast defined from {:?} to {:?}",
+            src, target
+        ),
+    }
+}
+
 #[derive(Debug)]
 pub struct VM {
     pub native_functions: Vec<NativeFunction>,
@@ -59,7 +196,7 @@ pub struct VM {
     pub consts: Vec<ConstValue>,        // top-level constant pool (if any)
     pub frames: Vec<CallFrame>,         // call stack
     pub frame_regs: usize,
-    pub stack: Vec<StructInstance>,
+    pub stack: Vec<StackSlot>,
     pub block_stack_bases: Vec<usize>,
 }
 
@@ -86,29 +223,19 @@ impl VM {
         });
         idx
     }
-
-    fn allocate_struct(&mut self, struct_idx: usize) -> usize {
-        let struct_proto = &self.struct_protos[struct_idx];
-        let num_fields = struct_proto.fields.len();
-        
-        let instance = StructInstance {
-            struct_idx,
-            fields: vec![RuntimeValue::Empty; num_fields],
-        };
-        
-        let stack_idx = self.stack.len();
-        self.stack.push(instance);
-        stack_idx
-    }
-
-    fn get_struct_mut(&mut self, stack_idx: usize) -> &mut StructInstance {
-        self.stack.get_mut(stack_idx)
-            .expect(&format!("Invalid struct stack index: {}", stack_idx))
+    
+   fn get_struct_mut(&mut self, stack_idx: usize) -> &mut StructInstance {
+        match self.stack.get_mut(stack_idx) {
+            Some(StackSlot::Struct(s)) => s,
+            _ => panic!("Invalid struct stack index: {}", stack_idx),
+        }
     }
 
     fn get_struct(&self, stack_idx: usize) -> &StructInstance {
-        self.stack.get(stack_idx)
-            .expect(&format!("Invalid struct stack index: {}", stack_idx))
+        match self.stack.get(stack_idx) {
+            Some(StackSlot::Struct(s)) => s,
+            _ => panic!("Invalid struct stack index: {}", stack_idx),
+        }
     }
 
     fn cleanup_stack(&mut self, stack_base: usize) {
@@ -167,80 +294,80 @@ impl VM {
                         };
                     }
                     x if x == Opcode::NewStruct as u32 => {
-                        // A = target register, Bx = struct constant index
                         let const_val = proto.ctx.consts.get(bx)
                             .cloned()
                             .or_else(|| self.consts.get(bx).cloned())
                             .expect(&format!("NewStruct: OOB bx={}", bx));
-                        
-                        if let ConstValue::Struct(struct_idx) = const_val {
-                            // Allocate struct on stack directly (inline the allocate_struct logic)
+
+                        if let ConstValue::StructInst(struct_idx, concrete_type) = const_val {
                             let struct_proto = &self.struct_protos[struct_idx];
-                            let num_fields = struct_proto.fields.len();
-                            
+
                             let instance = StructInstance {
                                 struct_idx,
-                                fields: vec![RuntimeValue::Empty; num_fields],
+                                concrete_type: concrete_type.clone(),
+                                fields: vec![RuntimeValue::Empty; struct_proto.fields.len()],
                             };
-                            
+
+                            // 🔥 THIS WAS MISSING
                             let stack_idx = self.stack.len();
-                            self.stack.push(instance);
-                            
-                            frame.regs[a] = RuntimeValue::Ptr(struct_proto.struct_type.clone(), stack_idx);
+                            self.stack.push(StackSlot::Struct(instance));
+
+                            let struct_name = self.struct_protos[struct_idx].name.clone();
+                            frame.regs[a] = RuntimeValue::Ptr(
+                                VType::Struct(struct_name, concrete_type.clone()),
+                                stack_idx
+                            );
                         } else {
-                            panic!("NewStruct: constant at index {} is not a Struct", bx);
+                            panic!("NewStruct: expected StructInst, got {:?}", const_val);
                         }
                     }
 
                     x if x == Opcode::StoreStructField as u32 => {
-                        // A = struct register, B = field index, C = value register
-                        if a >= frame.regs.len() || c >= frame.regs.len() {
-                            panic!("StoreStructField: register OOB a={} c={}", a, c);
-                        }
+                        let raw_value = frame.regs[c].clone();
 
-                        let value = frame.regs[c].clone();
-                        
-                        match &frame.regs[a] {
-                            RuntimeValue::Ptr(VType::Struct(..), stack_idx) => {
-                                // Extract the validation and struct access outside the frame borrow
-                            }
-                            other => panic!("StoreStructField: target is not a struct pointer: {:?}", other),
-                        }
-                        
-                        // Now handle the struct operation after frame borrow is released
-                        if let RuntimeValue::Ptr(VType::Struct(..), stack_idx) = &frame.regs[a] {
-                            let stack_idx = *stack_idx;
-                            if stack_idx >= self.stack.len() {
-                                panic!("StoreStructField: invalid struct pointer {}", stack_idx);
-                            }
-                            
-                            if b >= self.stack[stack_idx].fields.len() {
-                                panic!("StoreStructField: field index {} out of bounds", b);
-                            }
-                            self.stack[stack_idx].fields[b] = value;
-                        }
+                        let stack_idx = match &frame.regs[a] {
+                            RuntimeValue::Ptr(VType::Struct(_, _), idx) => *idx,
+                            other => panic!("StoreStructField: not a struct pointer: {:?}", other),
+                        };
+
+                        // 🔥 Immutable phase
+                        let (struct_idx, concrete_type) = match self.stack.get(stack_idx) {
+                            Some(StackSlot::Struct(s)) => (s.struct_idx, s.concrete_type.clone()),
+                            _ => panic!("StoreStructField: not a struct"),
+                        };
+
+                        let struct_proto = &self.struct_protos[struct_idx];
+                        let field_type = {
+                            let (_, proto_ty) = &struct_proto.fields[b];
+
+                            resolve_type(
+                                proto_ty,
+                                &concrete_type,
+                                &struct_proto.generics, // 🔥 NEW
+                            )
+                        };
+
+                        // 🔥 Mutable phase
+                        let s = self.get_struct_mut(stack_idx);
+
+                        let value = cast_runtime_value(raw_value, &field_type);
+                        s.fields[b] = value;
                     }
 
                     x if x == Opcode::LoadStructField as u32 => {
-                        // A = target register, B = struct register, C = field index
-                        if a >= frame.regs.len() || b >= frame.regs.len() {
-                            panic!("LoadStructField: register OOB a={} b={}", a, b);
-                        }
-
-                        match &frame.regs[b] {
-                            RuntimeValue::Ptr(VType::Struct(..), stack_idx) => {
-                                let stack_idx = *stack_idx;
-                                if stack_idx >= self.stack.len() {
-                                    panic!("LoadStructField: invalid struct pointer {}", stack_idx);
-                                }
-                                
-                                if c >= self.stack[stack_idx].fields.len() {
-                                    panic!("LoadStructField: field index {} out of bounds", c);
-                                }
-                                frame.regs[a] = self.stack[stack_idx].fields[c].clone();
+                        let stack_idx = match &self.frames[top_idx].regs[b] {
+                            RuntimeValue::Ptr(VType::Struct(..), idx) => *idx,
+                            other => panic!("LoadStructField: not a struct pointer: {:?}", other),
+                        };
+                        // frame borrow ends here ^
+                        let val = match self.stack.get(stack_idx) {
+                            Some(StackSlot::Struct(s)) => {
+                                if c >= s.fields.len() { panic!("LoadStructField: field OOB {}", c); }
+                                s.fields[c].clone()
                             }
-                            other => panic!("LoadStructField: source is not a struct pointer: {:?}", other),
-                        }
+                            _ => panic!("LoadStructField: stack slot is not a struct"),
+                        };
+                        self.frames[top_idx].regs[a] = val;
                     }
                     x if x == Opcode::Move as u32 => {
                         if bx >= frame.regs.len() || a >= frame.regs.len() {
@@ -321,10 +448,10 @@ impl VM {
                         let right = &frame.regs[c];
 
                         let result = match opcode {
-                            x if x == Opcode::Add as u32 => apply_binop(left, right, |x, y| x + y),
-                            x if x == Opcode::Sub as u32 => apply_binop(left, right, |x, y| x - y),
-                            x if x == Opcode::Mul as u32 => apply_binop(left, right, |x, y| x * y),
-                            x if x == Opcode::Div as u32 => apply_binop(left, right, |x, y| x / y),
+                            x if x == Opcode::Add as u32 => apply_binop!(left, right, +),
+                            x if x == Opcode::Sub as u32 => apply_binop!(left, right, -),
+                            x if x == Opcode::Mul as u32 => apply_binop!(left, right, *),
+                            x if x == Opcode::Div as u32 => apply_binop!(left, right, /),
                             _ => unreachable!(),
                         };
 
@@ -377,7 +504,8 @@ impl VM {
                         if a >= frame.regs.len() || src >= frame.regs.len() {
                             panic!("LNot: register OOB a={} src={}", a, src);
                         }
-                        frame.regs[a] = RuntimeValue::Bool(truthy(&frame.regs[src]));
+                        let res = !truthy(&frame.regs[src]);
+                        frame.regs[a] = RuntimeValue::Bool(res);
                     }
                     x if x == Opcode::LAnd as u32 => {
                         // A = target, B = left, C = right
@@ -443,6 +571,106 @@ impl VM {
                         } else {
                             panic!("EndBlock without matching BeginBlock for locals");
                         }
+                    }
+                    x if x == Opcode::Cast as u32 => {
+                        let const_val = proto.ctx.consts.get(bx)
+                            .cloned()
+                            .or_else(|| self.consts.get(bx).cloned())
+                            .expect(&format!("Cast: OOB bx={}", bx));
+                        let target_type = if let ConstValue::Type(t) = const_val {
+                            t
+                        } else {
+                            panic!("Cast: not a Type const at {}", bx);
+                        };
+
+                        match (&frame.regs[a].clone(), &target_type) {
+                            (RuntimeValue::Ptr(VType::Array(_), stack_idx), VType::Array(to_elem)) => {
+                                let stack_idx = *stack_idx;
+                                let to_elem = *to_elem.clone();
+                                if let Some(StackSlot::Array(elems)) = self.stack.get_mut(stack_idx) {
+                                    for v in elems.iter_mut() {
+                                        let old = std::mem::replace(v, RuntimeValue::Empty);
+                                        *v = cast_runtime_value(old, &to_elem);
+                                    }
+                                }
+                                frame.regs[a] = RuntimeValue::Ptr(target_type, stack_idx);
+                            }
+                            _ => {
+                                let src = frame.regs[a].clone();
+                                frame.regs[a] = cast_runtime_value(src, &target_type);
+                            }
+                        }
+                    }
+
+                    x if x == Opcode::NewArray as u32 => {
+                        let const_val = proto.ctx.consts.get(bx)
+                            .cloned()
+                            .or_else(|| self.consts.get(bx).cloned())
+                            .expect(&format!("NewArray: OOB bx={}", bx));
+
+                        let elem_type = if let ConstValue::Array(elem) = const_val {
+                            *elem
+                        } else {
+                            panic!("NewArray: constant at index {} is not Array, got {:?}", bx, const_val);
+                        };
+
+                        let stack_idx = self.stack.len();
+                        self.stack.push(StackSlot::Array(Vec::new()));
+                        frame.regs[a] = RuntimeValue::Ptr(VType::Array(Box::new(elem_type)), stack_idx);
+                    }
+
+                    x if x == Opcode::GetArrayIdx as u32 => {
+                        let idx = match &frame.regs[c] {
+                            RuntimeValue::USize(n) => *n,
+                            RuntimeValue::I32(n) if *n >= 0 => *n as usize,
+                            other => panic!("GetArrayIdx: bad index: {:?}", other),
+                        };
+                        let stack_idx = match &frame.regs[b] {
+                            RuntimeValue::Ptr(VType::Array(..), i) => *i,
+                            other => panic!("GetArrayIdx: not an array ptr: {:?}", other),
+                        };
+                        let val = match self.stack.get(stack_idx) {
+                            Some(StackSlot::Array(elems)) => {
+                                if idx >= elems.len() { panic!("GetArrayIdx: OOB {} len={}", idx, elems.len()); }
+                                elems[idx].clone()
+                            }
+                            _ => panic!("GetArrayIdx: stack slot is not an array"),
+                        };
+                        frame.regs[a] = val;
+                    }
+
+                    x if x == Opcode::SetArrayIdx as u32 => {
+                        let idx = match &frame.regs[b] {
+                            RuntimeValue::USize(n) => *n,
+                            RuntimeValue::I32(n) if *n >= 0 => *n as usize,
+                            other => panic!("SetArrayIdx: bad index: {:?}", other),
+                        };
+                        let value = frame.regs[c].clone();
+                        let stack_idx = match &frame.regs[a] {
+                            RuntimeValue::Ptr(VType::Array(..), i) => *i,
+                            other => panic!("SetArrayIdx: not an array ptr: {:?}", other),
+                        };
+                        match self.stack.get_mut(stack_idx) {
+                            Some(StackSlot::Array(elems)) => {
+                                if idx >= elems.len() {
+                                    elems.push(value);
+                                } else {
+                                    elems[idx] = value;
+                                }
+                            }
+                            _ => panic!("SetArrayIdx: stack slot is not an array"),
+                        }
+                    }
+                    x if x == Opcode::ArrayLen as u32 => {
+                        let stack_idx = match &frame.regs[a] {
+                            RuntimeValue::Ptr(VType::Array(..), i) => *i,
+                            other => panic!("ArrayLen: not an array ptr: {:?}", other),
+                        };
+                        let len = match self.stack.get(stack_idx) {
+                            Some(StackSlot::Array(elems)) => elems.len(),
+                            _ => panic!("ArrayLen: stack slot is not an array"),
+                        };
+                        frame.regs[bx] = RuntimeValue::USize(len);
                     }
                     _ => {
                         panic!("Unknown opcode {} in proto {}", opcode, frame.proto_index);
@@ -510,16 +738,6 @@ impl VM {
                 caller.regs[0] = return_val.unwrap_or(RuntimeValue::Empty);
             }
         }
-    }
-}
-
-fn apply_binop<F>(left: &RuntimeValue, right: &RuntimeValue, op: F) -> RuntimeValue
-    where
-        F: Fn(i32, i32) -> i32,
-{
-    match (left, right) {
-        (RuntimeValue::I32(l), RuntimeValue::I32(r)) => RuntimeValue::I32(op(*l, *r)),
-        _ => panic!("Binary operation applied to non-I32 operands: {:?} {:?}", left, right),
     }
 }
 

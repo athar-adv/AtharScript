@@ -67,7 +67,11 @@ fn dump_protos(ctx: &CompileCtx) {
                                || x == Opcode::BeginBlock as u32
                                || x == Opcode::Ret as u32
                                || x == Opcode::EndBlock as u32
-                               || x == Opcode::NewStruct as u32) {
+                               || x == Opcode::NewStruct as u32
+                               || x == Opcode::ArrayLen as u32
+                               || x == Opcode::NewArray as u32
+                        )
+            {
                 let (opcode, a, bx) = decode_instruction_abx(*instr);
                 line = format!("    {:04} {:08x} op={} A={} BX={}", ip, instr, opcode, a, bx);
 
@@ -100,6 +104,12 @@ fn dump_protos(ctx: &CompileCtx) {
                 else if opcode == Opcode::EndBlock as u32 {
                     "; END-BLOCK".into()
                 }
+                else if opcode == Opcode::ArrayLen as u32 {
+                    "; ARRAY-LEN".into()
+                }
+                else if opcode == Opcode::NewArray as u32 {
+                    "; NEW-ARRAY".into()
+                }
                 else {
                     "; OP-CODE(2wide)".into()
                 };
@@ -112,7 +122,11 @@ fn dump_protos(ctx: &CompileCtx) {
                                        || x == Opcode::Le as u32
                                        || x == Opcode::Lt as u32
                                        || x == Opcode::StoreStructField as u32
-                                       || x == Opcode::LoadStructField as u32) {
+                                       || x == Opcode::LoadStructField as u32
+                                       || x == Opcode::SetArrayIdx as u32
+                                       || x == Opcode::GetArrayIdx as u32
+                            )
+            {
                 let (opcode, a, b, c) = decode_instruction_abc(*instr);
                 line = format!("    {:04} {:08x} op={} A={} B={} C={}", ip, instr, opcode, a, b, c);
 
@@ -143,6 +157,15 @@ fn dump_protos(ctx: &CompileCtx) {
                 else if opcode == Opcode::Lt as u32 {
                     "; LT".into()
                 }
+                else if opcode == Opcode::SetArrayIdx as u32 {
+                    "; ARR-SET".into()
+                }
+                else if opcode == Opcode::GetArrayIdx as u32 {
+                    "; ARR-GET".into()
+                }
+                else if opcode == Opcode::Lt as u32 {
+                    "; LT".into()
+                }
                 else {
                     "; OP-CODE(3wide)".into()
                 };
@@ -169,17 +192,17 @@ fn dump_protos(ctx: &CompileCtx) {
 
 fn main() {
     use std::{fs, process};
-    let contents = match fs::read_to_string("../input.ches") {
+    let contents = match fs::read_to_string("./input.ath") {
         Ok(contents) => contents,
         Err(e) => {
-            eprintln!("Error reading file '{}': {}", "../input.ches", e);
+            eprintln!("Error reading file '{}': {}", "./input.ath", e);
             process::exit(1);
         }
     };
 
     let tokens = tokenize(contents);
     let ast = parse(tokens).unwrap();
-    //println!("{:#?}", ast);
+    println!("{:#?}", ast);
     
     let mut ctx = CompileCtx::new();
     let native_fns: Vec<NativeFunction> = vec![
@@ -193,7 +216,7 @@ fn main() {
     ];
     
     ctx.register_native_fns(&native_fns);
-
+    
     let mut code = Vec::new();
     compile_stmt(ast, &mut ctx, &mut code);
     dump_protos(&ctx);
