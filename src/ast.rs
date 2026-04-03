@@ -67,6 +67,11 @@ pub enum AstNode {
         target: Box<AstNode>,
         index: Box<AstNode>,
     },
+    // In AstNode
+    TypeCast {
+        value: Box<AstNode>,
+        ty: VType,
+    },
     Return {
         args: Vec<AstNode>
     },
@@ -597,38 +602,30 @@ impl Parser {
     }
 
     fn parse_declaration(&mut self) -> Result<AstNode, String> {
+        // Parse the variable name
         let name = match consume(&mut self.tokens) {
             Some(Token::IDENT(ident)) => AstNode::Identifier(ident.to_string()),
-            // Some(Token::FN) => {
-            //     let r = self.parse_function();
-            //     return r
-            // }
-            // Some(Token::STRUCT) => {
-            //     let r = self.parse_struct_declaration();
-            //     return r
-            // }
             _ => return Err("Expected identifier after 'let'".to_string()),
         };
-        
-        let v_type =
-            if let Some(Token::PUNCT(":")) = peek(&mut self.tokens)
-            {
-                consume(&mut self.tokens);
-                self.parse_type()?
-            }
-            else
-            {
-                VType::Auto
-            };
-        
+
+        // Parse optional type annotation for the declaration itself
+        let v_type = if let Some(Token::PUNCT(":")) = peek(&mut self.tokens) {
+            consume(&mut self.tokens); // consume the ':'
+            self.parse_type()?
+        } else {
+            VType::Auto
+        };
+
+        // Expect '=' after declaration
         expect(&mut self.tokens, Token::BINOP("="));
-        
+
+        // Parse the expression, which may contain its own type casts
         let value = self.parse_expression()?;
 
         Ok(AstNode::Declaration {
             name: Box::new(name),
             value: Box::new(value),
-            v_type
+            v_type,
         })
     }
 
@@ -746,6 +743,14 @@ impl Parser {
                         op: ".".to_string(),
                         left: Box::new(expr),
                         right: Box::new(AstNode::FieldKey(field)),
+                    };
+                }
+                Some(Token::PUNCT(":")) => {
+                    consume(&mut self.tokens);
+                    let ty = self.parse_type()?;
+                    expr = AstNode::TypeCast {
+                        value: Box::new(expr),
+                        ty,
                     };
                 }
                 _ => break,

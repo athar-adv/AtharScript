@@ -113,27 +113,26 @@ fn instantiate_struct(
     }
 
     // Build substitution map
-    let mut subst = HashMap::new();
-    for (g, arg) in base.generics.iter().zip(generic_args.iter()) {
-        subst.insert(g.clone(), arg.clone());
-    }
+    let subst: HashMap<_, _> = base.generics.iter()
+        .cloned()
+        .zip(generic_args.iter().cloned())
+        .collect();
 
     // Substitute fields
     let fields = base.fields.iter()
-        .map(|(name, ty)| {
-            (name.clone(), substitute_type(ty, &subst))
-        })
+        .map(|(name, ty)| (name.clone(), substitute_type(ty, &subst)))
         .collect::<Vec<_>>();
 
-    let new_idx = ctx.structs.len() - 1;
-
+    // Create new prototype
     let new_proto = StructPrototype {
-        name: key.clone(), // important: unique name
+        name: key.clone(), // unique name for instantiated generic
         fields,
         struct_type: VType::Struct(key.clone(), vec![]),
-        generics: vec![], // now concrete
+        generics: vec![], // concrete now
     };
 
+    // Push and get the correct index
+    let new_idx = ctx.structs.len();
     ctx.structs.push(new_proto);
     ctx.struct_instances.insert(key, new_idx);
 
@@ -416,11 +415,11 @@ pub fn coerce_type(from: &VType, to: &VType, ctx: &mut CompileCtx, reg: u32, cod
     }
 }
 
-fn type_of(ctx: &mut CompileCtx, node: AstNode) -> VType
+fn type_of(ctx: &mut CompileCtx, node: &AstNode) -> VType
 {
     match node {
         AstNode::Index { target, .. } => {
-            match type_of(ctx, *target) {
+            match type_of(ctx, &*target) {
                 VType::Array(elem_type) => *elem_type,
                 other => panic!("Cannot index into non-array type: {:?}", other),
             }
@@ -428,7 +427,7 @@ fn type_of(ctx: &mut CompileCtx, node: AstNode) -> VType
         AstNode::String(..) => VType::String,
         AstNode::Integer(..) => VType::I32,
         AstNode::Call {callee, args, generics} => {
-            if let AstNode::Identifier(name) = *callee {
+            if let AstNode::Identifier(name) = callee.as_ref() {
                 let proto_idx = ctx.find_fn_addr_by_name(name.as_str())
                     .unwrap_or_else(|| {
                         panic!("unknown symbol")
@@ -446,13 +445,13 @@ fn type_of(ctx: &mut CompileCtx, node: AstNode) -> VType
             }
         }
         AstNode::ArrayLiteral {exprs} => {
-            let first_type = type_of(ctx, *exprs[0].clone());
+            let first_type = type_of(ctx, &*exprs[0].clone());
             let len = exprs.len();
             if len > 1
             {
                 for i in 1..len
                 {
-                    let this_type = type_of(ctx, *exprs[i].clone());
+                    let this_type = type_of(ctx, &*exprs[i].clone());
                     if this_type != first_type {
                         panic!("Array types were not all the same")
                     }
@@ -470,7 +469,7 @@ fn type_of(ctx: &mut CompileCtx, node: AstNode) -> VType
         AstNode::BinaryOp {op, left, right} => {
             match op.as_str() {
                 "." => {
-                    let left_ty = type_of(ctx, *left);
+                    let left_ty = type_of(ctx, &*left);
 
                     match left_ty {
                         VType::Struct(name, generics) => {
@@ -486,14 +485,13 @@ fn type_of(ctx: &mut CompileCtx, node: AstNode) -> VType
                                 .find(|s| s.name == struct_name)
                                 .unwrap_or_else(|| panic!("Unknown struct '{}'", struct_name));
 
-                            let field_name = match *right {
-                                AstNode::FieldKey(f) => f,
-                                AstNode::Identifier(f) => f,
+                            let field_name = match right.as_ref() {
+                                AstNode::FieldKey(f) | AstNode::Identifier(f) => f, // borrow
                                 _ => panic!("Invalid field access RHS: {:?}", right),
                             };
 
                             let (_, field_ty) = proto.fields.iter()
-                                .find(|(fname, _)| fname == &field_name)
+                                .find(|(fname, _)| fname == field_name)
                                 .unwrap_or_else(|| {
                                     panic!("Field '{}' not found in struct '{}'", field_name, struct_name)
                                 });
@@ -515,6 +513,16 @@ pub fn compile_expr(ast: AstNode, ctx: &mut CompileCtx, reg: u32) -> Vec<Instruc
     let mut code = vec![];
     
     match ast {
+        AstNode::TypeCast { value, ty } => {
+            // Borrow for type checking
+            let from_ty = type_of(ctx, &*value);
+
+            // Compile the inner expression into the target register
+            code.extend(compile_expr(*value, ctx, reg));
+
+            // Emit a cast if needed
+            coerce_type(&from_ty, &ty, ctx, reg, &mut code);
+        }
         AstNode::Integer(n) => {
             let cidx = ctx.find_or_add_const(ConstValue::I32(n));
             code.push(pack_i_abx(Opcode::LoadConst, reg, cidx));
@@ -664,6 +672,7 @@ pub fn compile_expr(ast: AstNode, ctx: &mut CompileCtx, reg: u32) -> Vec<Instruc
                 field_regs.push(a);
             }
             let mut field_idcs = vec![];
+            println!("{}, {:?}", name, struct_proto.fields);
             for (i, (field_name, ..)) in fields.iter().enumerate() {
                 let field_idx = struct_proto.fields.iter()
                     .position(|(fname, _)| fname == field_name)
@@ -687,7 +696,7 @@ pub fn compile_expr(ast: AstNode, ctx: &mut CompileCtx, reg: u32) -> Vec<Instruc
 
             // Infer element type from the first element; all others must match or be
             // coercible to it.
-            let elem_type = type_of(ctx, *exprs[0].clone());
+            let elem_type = type_of(ctx, &exprs[0]);
             let len = exprs.len();
 
             // Allocate registers for all elements up-front (mirrors the Call convention).
@@ -707,7 +716,7 @@ pub fn compile_expr(ast: AstNode, ctx: &mut CompileCtx, reg: u32) -> Vec<Instruc
 
             for (i, expr) in exprs.into_iter().enumerate() {
                 let elem_reg  = elem_regs[i];
-                let expr_type = type_of(ctx, *expr.clone());
+                let expr_type = type_of(ctx, &expr);
 
                 // Compile the element expression into its dedicated register.
                 code.extend(compile_expr(*expr, ctx, elem_reg));
@@ -802,7 +811,7 @@ pub fn compile_stmt(ast: AstNode, ctx: &mut CompileCtx, code: &mut Vec<Instructi
             }
         }
         AstNode::Declaration { name, value, v_type } => {
-            let t = type_of(ctx, *(value.clone()));
+            let t = type_of(ctx, &value);
             
             if let AstNode::Identifier(name_str) = *name {
                 let reg = ctx.regs.alloc();

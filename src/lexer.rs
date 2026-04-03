@@ -147,7 +147,7 @@ pub fn tokenize(src: String) -> Vec<Token<'static>> {
         }
         
         match char {
-            '@' => {
+            '#' => {
                 while let Some(&next_char) = chars.peek() {
                     if next_char == '\n' {
                         chars.next();

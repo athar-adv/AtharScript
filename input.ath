@@ -1,8 +1,4 @@
 function main()
 {
-    let arr = {{1, 2}}
-    for (v in arr[0])
-    {
-        print(v)
-    }
+    print("Hello World!")
 }

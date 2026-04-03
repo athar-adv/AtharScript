@@ -6,6 +6,7 @@ use crate::VType;
 pub enum StackSlot {
     Struct(StructInstance),
     Array(Vec<RuntimeValue>),
+    Empty
 }
 
 #[derive(Debug, Clone)]
@@ -59,18 +60,38 @@ pub struct CallFrame {
     local_var_bases: Vec<usize>,
 }
 
-fn resolve_type(ty: &VType, concrete: &[VType], generic_names: &[String]) -> VType {
+fn resolve_type(
+    ty: &VType,
+    concrete: &[VType],
+    generic_names: &[String]
+) -> VType {
     match ty {
         VType::Generic(name) => {
             let idx = generic_names.iter()
                 .position(|g| g == name)
-                .expect("Generic not found in struct");
+                .expect("Generic not found");
 
             concrete.get(idx)
                 .cloned()
                 .expect("Missing concrete generic type")
         }
-        _ => ty.clone()
+        VType::Array(inner) => {
+            VType::Array(Box::new(
+                resolve_type(inner, concrete, generic_names)
+            ))
+        }
+        VType::Struct(name, generics) => {
+            VType::Struct(
+                name.clone(),
+                generics.iter()
+                    .map(|g| resolve_type(g, concrete, generic_names))
+                    .collect()
+            )
+        }
+        VType::Function => VType::Function,
+
+        // everything else
+        other => other.clone(),
     }
 }
 
@@ -91,9 +112,52 @@ macro_rules! apply_binop {
     };
 }
 
+fn can_cast_type(from: &VType, to: &VType) -> bool {
+    if from == to {
+        return true;
+    }
+
+    match (from, to) {
+        (VType::U8, VType::U16 | VType::U32 | VType::I32 | VType::I16 | VType::USize | VType::F32 | VType::F64) => true,
+        (VType::U16, VType::U32 | VType::I32 | VType::USize | VType::F32 | VType::F64 | VType::U8 | VType::I16) => true,
+        (VType::U32, VType::USize | VType::F32 | VType::F64 | VType::I32 | VType::U8 | VType::U16 | VType::I16) => true,
+
+        (VType::I8, VType::I16 | VType::I32 | VType::F32 | VType::F64 | VType::U8 | VType::U16 | VType::U32) => true,
+        (VType::I16, VType::I32 | VType::F32 | VType::F64 | VType::U8 | VType::U16 | VType::U32 | VType::I8) => true,
+        (VType::I32, VType::I8 | VType::I16 | VType::U8 | VType::U16 | VType::U32 | VType::F32 | VType::F64 | VType::USize) => true,
+
+        (VType::F32, VType::F64 | VType::I32 | VType::U32 | VType::I8 | VType::U8 | VType::USize) => true,
+        (VType::F64, VType::F32 | VType::I32 | VType::U32 | VType::I8 | VType::U8 | VType::USize) => true,
+
+        (VType::USize, VType::I32 | VType::U32 | VType::U8 | VType::U16 | VType::F32 | VType::F64) => true,
+        (VType::Array(a), VType::Array(b)) => can_cast_type(a, b),
+        (VType::Struct(n1, g1), VType::Struct(n2, g2)) => {
+            n1 == n2 && g1 == g2
+        }
+
+        _ => false,
+    }
+}
+
 fn cast_runtime_value(val: RuntimeValue, to: &VType) -> RuntimeValue {
     match (val, to) {
         (v, VType::Auto) => v,
+
+        (RuntimeValue::Ptr(VType::Array(from), idx), VType::Array(to)) => {
+            if can_cast_type(&from, to) {
+                RuntimeValue::Ptr(VType::Array(to.clone()), idx)
+            } else {
+                panic!("Array element type mismatch: {:?} -> {:?}", from, to)
+            }
+        }
+        (RuntimeValue::Ptr(VType::Struct(name1, g1), idx), VType::Struct(name2, g2)) => {
+            if name1 == *name2 && g1 == *g2 {
+                RuntimeValue::Ptr(VType::Struct(name2.clone(), g2.clone()), idx)
+            } else {
+                panic!("Struct type mismatch: {:?} -> {:?}", name1, name2)
+            }
+        }
+        
         // ── identity ──────────────────────────────────────────────────────────
         (RuntimeValue::I32(n),  VType::I32)   => RuntimeValue::I32(n),
         (RuntimeValue::U8(n),   VType::U8)    => RuntimeValue::U8(n),
@@ -188,6 +252,51 @@ fn cast_runtime_value(val: RuntimeValue, to: &VType) -> RuntimeValue {
     }
 }
 
+fn cast_value(val: RuntimeValue, to: &VType, stack: &mut [StackSlot]) -> RuntimeValue {
+    match val {
+        RuntimeValue::Ptr(VType::Array(_), stack_idx) => {
+            match to {
+                VType::Array(to_ty) => {
+                    let old_elements = match std::mem::replace(&mut stack[stack_idx], StackSlot::Array(vec![])) {
+                        StackSlot::Array(vec) => vec,
+                        _ => panic!("Ptr does not point to an array at index {}", stack_idx),
+                    };
+
+                    let new_elements: Vec<RuntimeValue> = old_elements
+                        .into_iter()
+                        .map(|elem| cast_value(elem, to_ty, stack))
+                        .collect();
+
+                    stack[stack_idx] = StackSlot::Array(new_elements);
+                    RuntimeValue::Ptr(VType::Array(Box::new(*to_ty.clone())), stack_idx)
+                }
+                VType::Auto => {
+                    RuntimeValue::Ptr(VType::Array(Box::new(VType::Auto)), stack_idx)
+                }
+                other => panic!("Cannot cast array pointer to non-array type: {:?}", other),
+            }
+        }
+
+        RuntimeValue::Ptr(VType::Struct(name1, g1), idx) => {
+            match to {
+                VType::Auto => {
+                    RuntimeValue::Ptr(VType::Struct(name1, g1), idx)
+                }
+                VType::Struct(name2, g2) => {
+                    if &name1 == name2 && &g1 == g2 {
+                        RuntimeValue::Ptr(VType::Struct(name2.clone(), g2.clone()), idx)
+                    } else {
+                        panic!("Struct type mismatch: {:?} -> {:?}", name1, name2);
+                    }
+                }
+                other => panic!("Cannot cast struct pointer to {:?}", other),
+            }
+        }
+
+        other => cast_runtime_value(other, to),
+    }
+}
+
 #[derive(Debug)]
 pub struct VM {
     pub native_functions: Vec<NativeFunction>,
@@ -213,7 +322,7 @@ impl VM {
             block_stack_bases: Vec::new()
         }
     }
-
+    
     pub fn register_native(&mut self, name: &str, /*param_count: usize, */func: fn(&[RuntimeValue]) -> RuntimeValue) -> usize {
         let idx = self.native_functions.len();
         self.native_functions.push(NativeFunction {
@@ -300,7 +409,8 @@ impl VM {
                             .expect(&format!("NewStruct: OOB bx={}", bx));
 
                         if let ConstValue::StructInst(struct_idx, concrete_type) = const_val {
-                            let struct_proto = &self.struct_protos[struct_idx];
+                            let struct_proto_idx = self.struct_protos.len() - (struct_idx - 1);
+                            let struct_proto = &self.struct_protos[struct_proto_idx];
 
                             let instance = StructInstance {
                                 struct_idx,
@@ -308,11 +418,10 @@ impl VM {
                                 fields: vec![RuntimeValue::Empty; struct_proto.fields.len()],
                             };
 
-                            // 🔥 THIS WAS MISSING
                             let stack_idx = self.stack.len();
                             self.stack.push(StackSlot::Struct(instance));
 
-                            let struct_name = self.struct_protos[struct_idx].name.clone();
+                            let struct_name = struct_proto.name.clone();
                             frame.regs[a] = RuntimeValue::Ptr(
                                 VType::Struct(struct_name, concrete_type.clone()),
                                 stack_idx
@@ -330,28 +439,21 @@ impl VM {
                             other => panic!("StoreStructField: not a struct pointer: {:?}", other),
                         };
 
-                        // 🔥 Immutable phase
-                        let (struct_idx, concrete_type) = match self.stack.get(stack_idx) {
-                            Some(StackSlot::Struct(s)) => (s.struct_idx, s.concrete_type.clone()),
+                        // Take the struct out of the stack temporarily
+                        let mut s = match std::mem::replace(&mut self.stack[stack_idx], StackSlot::Empty) {
+                            StackSlot::Struct(s) => s,
                             _ => panic!("StoreStructField: not a struct"),
                         };
 
-                        let struct_proto = &self.struct_protos[struct_idx];
-                        let field_type = {
-                            let (_, proto_ty) = &struct_proto.fields[b];
+                        let struct_proto_idx = self.struct_protos.len() - (s.struct_idx - 1);
+                        let struct_proto = &self.struct_protos[struct_proto_idx];
+                        let (_, proto_ty) = &struct_proto.fields[b];
 
-                            resolve_type(
-                                proto_ty,
-                                &concrete_type,
-                                &struct_proto.generics, // 🔥 NEW
-                            )
-                        };
+                        let field_type = resolve_type(proto_ty, &s.concrete_type, &struct_proto.generics);
+                        let value = cast_value(raw_value, &field_type, &mut self.stack);
 
-                        // 🔥 Mutable phase
-                        let s = self.get_struct_mut(stack_idx);
-
-                        let value = cast_runtime_value(raw_value, &field_type);
                         s.fields[b] = value;
+                        self.stack[stack_idx] = StackSlot::Struct(s);
                     }
 
                     x if x == Opcode::LoadStructField as u32 => {
@@ -587,17 +689,30 @@ impl VM {
                             (RuntimeValue::Ptr(VType::Array(_), stack_idx), VType::Array(to_elem)) => {
                                 let stack_idx = *stack_idx;
                                 let to_elem = *to_elem.clone();
-                                if let Some(StackSlot::Array(elems)) = self.stack.get_mut(stack_idx) {
-                                    for v in elems.iter_mut() {
-                                        let old = std::mem::replace(v, RuntimeValue::Empty);
-                                        *v = cast_runtime_value(old, &to_elem);
-                                    }
-                                }
+
+                                // Take ownership of the elements vector
+                                let old_elems = match std::mem::replace(
+                                    &mut self.stack[stack_idx],
+                                    StackSlot::Array(Vec::new()),
+                                ) {
+                                    StackSlot::Array(v) => v,
+                                    _ => panic!("Ptr does not point to an array at stack index {}", stack_idx),
+                                };
+
+                                // Recursively cast each element
+                                let new_elems: Vec<RuntimeValue> = old_elems
+                                    .into_iter()
+                                    .map(|v| cast_value(v, &to_elem, &mut self.stack))
+                                    .collect();
+
+                                // Put the array back into the stack
+                                self.stack[stack_idx] = StackSlot::Array(new_elems);
+
                                 frame.regs[a] = RuntimeValue::Ptr(target_type, stack_idx);
                             }
                             _ => {
                                 let src = frame.regs[a].clone();
-                                frame.regs[a] = cast_runtime_value(src, &target_type);
+                                frame.regs[a] = cast_value(src, &target_type, &mut self.stack);
                             }
                         }
                     }
