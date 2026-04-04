@@ -2,7 +2,7 @@
 
 pub hi: u8 = 10
 
-pub function add(a: u8, b: u8) -> u8
+pub fun add(a: u8, b: u8) -> u8
 {
     return (a + b) : u8
 }

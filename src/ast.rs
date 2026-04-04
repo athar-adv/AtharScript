@@ -1,5 +1,7 @@
 #![allow(unused)]
 
+//ast.rs
+
 use crate::lexer::Token;
 use crate::v_type::{VType, vty_from_str, is_vtype};
 use core::option::Option::None;
@@ -100,6 +102,9 @@ pub enum AstNode {
         fields: Vec<(String, AstNode)>,
         generics: Vec<VType>
     },
+    Namespace {
+        name: String,
+    },
     ArrayLiteral {
         exprs: Vec<Box<AstNode>>
     },
@@ -133,6 +138,7 @@ fn consume(tokens: &mut PeekIter<Token<'static>>) -> Option<Token<'static>>
 {
     tokens.next()
 }
+
 fn expect(tokens: &mut PeekIter<Token<'static>>, expected: Token<'static>) -> Token<'static>
 {
     let tok = consume(tokens)
@@ -144,6 +150,7 @@ fn expect(tokens: &mut PeekIter<Token<'static>>, expected: Token<'static>) -> To
     }
     tok
 }
+
 fn peek<'a>(tokens: &'a mut PeekIter<Token<'static>>) -> Option<&'a Token<'static>>
 {
     tokens.peek()
@@ -839,18 +846,22 @@ impl Parser {
                     consume(&mut self.tokens);
                     expr = self.finish_parse_index(expr)?;
                 }
-                Some(Token::PUNCT(".")) => {
-                    consume(&mut self.tokens);
+                Some(Token::PUNCT(".")) | Some(Token::BINOP("::")) => {
+                    let op = match consume(&mut self.tokens) {
+                        Some(Token::PUNCT(".")) => ".",
+                        Some(Token::BINOP("::")) => "::",
+                        _ => unreachable!(),
+                    };
 
                     let field = match consume(&mut self.tokens) {
                         Some(Token::IDENT(name)) => name.to_string(),
-                        _ => return Err("Expected field name after '.'".into()),
+                        _ => return Err("Expected identifier after access operator".into()),
                     };
 
                     expr = AstNode::BinaryOp {
-                        op: ".".to_string(),
+                        op: op.to_string(),
                         left: Box::new(expr),
-                        right: Box::new(AstNode::FieldKey(field)),
+                        right: Box::new(AstNode::Identifier(field)),
                     };
                 }
                 Some(Token::PUNCT(":")) => {

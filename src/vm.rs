@@ -1,3 +1,5 @@
+//vm.rs
+
 use crate::compiler::{coerce_type, ConstValue, Instruction, Opcode, PrototypeFunction, StructPrototype, A_SHIFT, B_SHIFT, C_SHIFT, OPCODE_BITS};
 use crate::compiler::ConstValue as CV;
 use crate::VType;
@@ -47,11 +49,13 @@ pub struct StructInstance {
     fields: Vec<RuntimeValue>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct NativeFunction {
     pub name: String,
     //pub param_count: usize,
     pub func: fn(&[RuntimeValue]) -> RuntimeValue,
+    pub params: Vec<VType>,
+    pub return_type: VType
 }
 
 #[derive(Debug)]
@@ -368,11 +372,12 @@ impl VM {
         }
     }
     
-    pub fn register_native(&mut self, name: &str, /*param_count: usize, */func: fn(&[RuntimeValue]) -> RuntimeValue) -> usize {
+    pub fn register_native(&mut self, name: &str, params: Vec<VType>, return_type: VType, func: fn(&[RuntimeValue]) -> RuntimeValue) -> usize {
         let idx = self.native_functions.len();
         self.native_functions.push(NativeFunction {
             name: name.to_string(),
-            //param_count,
+            return_type,
+            params,
             func,
         });
         idx

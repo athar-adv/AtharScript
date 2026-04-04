@@ -1,25 +1,23 @@
 # input.luc
 
 import module "./module.luc"
+import math "@std/math"
+import io "@std/io"
 
 use module {add, hi}
 
-pub Var: mut u8 = 10
-pub STRING_CONSTANT = "hello world"
-
-pub function sub(a: u8, b: u8)
-{
-    return a - b
+pub var = 10
+pub struct bruh {
+    a: u8
 }
 
-function main()
+pub fun new_bruh(a: u8)
 {
-    let fool: module::MyStruct = module::MyStruct {
-        hi: 10
-    }
-    let v: u8 = add(hi, 12)
-    print(v)
-    print(fool.hi)
+    return bruh {a: a}
 }
 
-
+fun main()
+{
+    let v: i32 = math::floor(23.323 : f64)
+    io::print(v)
+}

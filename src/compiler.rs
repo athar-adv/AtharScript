@@ -1,6 +1,8 @@
+// compiler.rs
+
 use std::collections::HashMap;
 use crate::v_type::VType;
-use crate::vm::NativeFunction;
+use crate::vm::{NativeFunction, RuntimeValue};
 use crate::ast::{AstNode, Parameter, Parser};
 use crate::lexer::tokenize;
 
@@ -35,24 +37,26 @@ pub struct PrototypeFunction {
 }
 
 #[derive(Debug, Clone)]
+pub struct Namespace {
+    pub symbols: HashMap<String, Symbol>,
+    pub const_symbols: HashMap<String, u32>,
+    pub fn_map: HashMap<String, usize>,
+    pub native_map: HashMap<String, NativeEntry>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NativeEntry {
+    pub global_idx: usize,
+    pub params: Vec<VType>,
+    pub return_type: VType,
+}
+
+#[derive(Debug, Clone)]
 pub struct StructPrototype {
     pub name: String,
     pub fields: Vec<(String, VType)>,
     pub struct_type: VType,
     pub generics: Vec<String>
-}
-
-#[derive(Debug, Clone)]
-pub struct CompileCtx {
-    pub consts: Vec<ConstValue>,
-    pub symbols: Vec<Symbol>,
-    pub protos: Vec<PrototypeFunction>,
-    pub structs: Vec<StructPrototype>,
-    pub regs: RegAlloc,
-    pub native_map: HashMap<String, usize>,
-    pub struct_instances: HashMap<String, usize>,
-    pub init_code: Vec<Instruction>,
-    pub const_symbols: HashMap<String, u32>, // name -> const pool index
 }
 
 macro_rules! find_const_arm {
@@ -79,104 +83,6 @@ fn substitute_type(ty: &VType, map: &HashMap<String, VType>) -> VType {
             VType::Array(Box::new(substitute_type(inner, map)))
         }
         other => other.clone()
-    }
-}
-
-pub struct TypeResolver<'a> {
-    pub local_structs: &'a HashMap<String, VType>,
-    pub imported_structs: &'a HashMap<String, HashMap<String, VType>>, // module_alias -> struct_name -> VType
-}
-
-impl<'a> TypeResolver<'a> {
-    pub fn resolve_node(&self, node: &mut AstNode) -> Result<(), String> {
-        match node {
-            AstNode::Declaration { v_type, .. } |
-            AstNode::StructDecl { struct_type: v_type, .. } => {
-                *v_type = self.resolve_type(v_type)?;
-            }
-            AstNode::Function { params, return_type, body, .. } => {
-                for param in params {
-                    param.v_type = self.resolve_type(&param.v_type)?;
-                }
-                *return_type = self.resolve_type(return_type)?;
-                for stmt in body {
-                    self.resolve_node(stmt)?;
-                }
-            }
-            AstNode::StructLiteral { generics, .. } => {
-                for g in generics {
-                    *g = self.resolve_type(g)?;
-                }
-            }
-            AstNode::Call { generics, callee, args } => {
-                for g in generics { *g = self.resolve_type(g)?; }
-                self.resolve_node(callee)?;
-                for arg in args { self.resolve_node(arg)?; }
-            }
-            AstNode::Assignment { assignee, value } |
-            AstNode::BinaryOp { left: assignee, right: value, .. }
-            => {
-                self.resolve_node(assignee)?;
-                self.resolve_node(value)?;
-            }
-            AstNode::TypeCast { value: assignee, ty: value } => {
-                self.resolve_node(assignee)?;
-                self.resolve_type(value)?;
-            }
-            AstNode::Return { args } => {
-                for a in args {
-                    self.resolve_node(a)?;
-                }
-            }
-            AstNode::ForLoop { params, iteratee, body } => {
-                for p in params { p.v_type = self.resolve_type(&p.v_type)?; }
-                self.resolve_node(iteratee)?;
-                for s in body { self.resolve_node(s)?; }
-            }
-            AstNode::WhileLoop { condition, body } => {
-                self.resolve_node(condition)?;
-                for s in body { self.resolve_node(s)?; }
-            }
-            AstNode::ConditionalBranch { condition, body, next } => {
-                if let Some(cond) = condition { self.resolve_node(cond)?; }
-                for s in body { self.resolve_node(s)?; }
-                if let Some(next_branch) = next { self.resolve_node(next_branch)?; }
-            }
-            AstNode::DoBlock(body) | AstNode::ArrayLiteral { exprs: body } => {
-                for s in body { self.resolve_node(s)?; }
-            }
-            AstNode::Program(body) => {
-                for s in body { self.resolve_node(s)?; }
-            }
-            _ => {} // literals, identifiers, imports, etc.
-        }
-        Ok(())
-    }
-
-    fn resolve_type(&self, ty: &VType) -> Result<VType, String> {
-        match ty {
-            VType::Unresolved(name) => {
-                if let Some(struct_type) = self.local_structs.get(name) {
-                    Ok(struct_type.clone())
-                } else {
-                    // search imports
-                    for module in self.imported_structs.values() {
-                        if let Some(struct_type) = module.get(name) {
-                            return Ok(struct_type.clone());
-                        }
-                    }
-                    Err(format!("Cannot resolve type '{}'", name))
-                }
-            }
-            VType::Struct(name, generics) => {
-                let mut resolved_generics = Vec::new();
-                for g in generics {
-                    resolved_generics.push(self.resolve_type(g)?);
-                }
-                Ok(VType::Struct(name.clone(), resolved_generics))
-            }
-            _ => Ok(ty.clone())
-        }
     }
 }
 
@@ -232,6 +138,38 @@ fn instantiate_struct(
     new_idx
 }
 
+pub type NativeModuleRegistry = HashMap<String, NativeNamespace>;
+
+pub struct NativeNamespace {
+    pub name: String,
+    pub functions: Vec<NativeFunction>,
+}
+
+impl NativeNamespace {
+    pub fn new(name: &str) -> Self {
+        Self { name: name.to_string(), functions: vec![] }
+    }
+    
+    pub fn register(mut self, name: &str, params: Vec<VType>, return_type: VType, func: fn(&[RuntimeValue]) -> RuntimeValue) -> Self {
+        self.functions.push(NativeFunction { name: name.to_string(), func, params, return_type });
+        self
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CompileCtx {
+    pub consts: Vec<ConstValue>,
+    pub symbols: Vec<Symbol>,
+    pub protos: Vec<PrototypeFunction>,
+    pub structs: Vec<StructPrototype>,
+    pub regs: RegAlloc,
+    pub native_map: HashMap<String, usize>,
+    pub struct_instances: HashMap<String, usize>,
+    pub init_code: Vec<Instruction>,
+    pub const_symbols: HashMap<String, u32>, // name -> const pool index
+    pub namespaces: HashMap<String, Namespace>,
+}
+
 impl CompileCtx {
     pub fn new() -> Self {
         Self {
@@ -244,6 +182,7 @@ impl CompileCtx {
             struct_instances: HashMap::new(),
             init_code: vec![],
             const_symbols: HashMap::new(),
+            namespaces: HashMap::new(),
         }
     }
 
@@ -258,6 +197,35 @@ impl CompileCtx {
             struct_instances: HashMap::new(),
             init_code: vec![],
             const_symbols: parent.const_symbols.clone(),
+            namespaces: parent.namespaces.clone(),
+        }
+    }
+
+    pub fn register_native_namespaces(
+        &mut self,
+        all_natives: &mut Vec<NativeFunction>,
+        namespaces: Vec<NativeNamespace>,
+    ) {
+        for ns in namespaces {
+            let mut ns_map = Namespace {
+                symbols: HashMap::new(),
+                const_symbols: HashMap::new(),
+                fn_map: HashMap::new(),
+                native_map: HashMap::new(),
+            };
+
+            for nf in ns.functions {
+                let clone = nf.clone();
+                let idx = all_natives.len(); // position in the VM's vec = the index
+                ns_map.native_map.insert(nf.name.clone(), NativeEntry {
+                    global_idx: idx,
+                    params: nf.params,
+                    return_type: nf.return_type
+                });
+                all_natives.push(clone);
+            }
+
+            self.namespaces.insert(ns.name, ns_map);
         }
     }
 
@@ -276,8 +244,18 @@ impl CompileCtx {
             }
             ConstValue::Function(idx) => find_const_arm!(self.consts, ConstValue::Function, idx),
             ConstValue::NativeFunction(idx) => find_const_arm!(self.consts, ConstValue::NativeFunction, idx),
-            ConstValue::I32(i) => find_const_arm!(self.consts, ConstValue::I32, i),
+
             ConstValue::U8(i) => find_const_arm!(self.consts, ConstValue::U8, i),
+            ConstValue::I8(i) => find_const_arm!(self.consts, ConstValue::I8, i),
+            ConstValue::U16(i) => find_const_arm!(self.consts, ConstValue::U16, i),
+            ConstValue::I16(i) => find_const_arm!(self.consts, ConstValue::I16, i),
+            ConstValue::U32(i) => find_const_arm!(self.consts, ConstValue::U32, i),
+            ConstValue::I32(i) => find_const_arm!(self.consts, ConstValue::I32, i),
+            ConstValue::U64(i) => find_const_arm!(self.consts, ConstValue::U64, i),
+            ConstValue::I64(i) => find_const_arm!(self.consts, ConstValue::I64, i),
+            ConstValue::F32(i) => find_const_arm!(self.consts, ConstValue::F32, i),
+            ConstValue::F64(i) => find_const_arm!(self.consts, ConstValue::F64, i),
+            
             ConstValue::USize(i) => find_const_arm!(self.consts, ConstValue::USize, i),
             ConstValue::Str(ref i) => find_const_arm!(self.consts, ConstValue::Str, *i),
             ConstValue::Struct(i) => find_const_arm!(self.consts, ConstValue::Struct, i),
@@ -525,6 +503,9 @@ pub fn coerce_type(from: &VType, to: &VType, ctx: &mut CompileCtx, reg: u32, cod
 fn type_of(ctx: &mut CompileCtx, node: &AstNode) -> VType
 {
     match node {
+        AstNode::TypeCast { value, ty } => {
+            ty.clone()
+        }
         AstNode::Index { target, .. } => {
             match type_of(ctx, &*target) {
                 VType::Array(elem_type) => *elem_type,
@@ -533,16 +514,62 @@ fn type_of(ctx: &mut CompileCtx, node: &AstNode) -> VType
         }
         AstNode::String(..) => VType::String,
         AstNode::Integer(..) => VType::I32,
+        AstNode::Double(..) => VType::F64,
         AstNode::Call {callee, args, generics} => {
-            if let AstNode::Identifier(name) = callee.as_ref() {
-                let proto_idx = ctx.find_fn_addr_by_name(name.as_str())
+            match callee.as_ref() {
+                AstNode::Identifier(name) => {
+                    let proto_idx = ctx.find_fn_addr_by_name(name.as_str())
                     .unwrap_or_else(|| {
                         panic!("unknown symbol")
                     });
-                let proto = &ctx.protos[proto_idx];
-                return proto.return_type.clone();
+                    let proto = &ctx.protos[proto_idx];
+                    return proto.return_type.clone();
+                }
+                AstNode::BinaryOp {op, left, right} if op == "::" => {
+                    fn flatten(node: &AstNode) -> (String, String) {
+                        match node {
+                            AstNode::BinaryOp { op, left, right } if op == "::" => {
+                                let (ns, rest) = flatten(left);
+                                let rhs = match right.as_ref() {
+                                    AstNode::Identifier(s) => s.clone(),
+                                    _ => panic!("Invalid namespace"),
+                                };
+                                (ns, if rest.is_empty() { rhs } else { format!("{}::{}", rest, rhs) })
+                            }
+                            AstNode::Identifier(ns) => (ns.clone(), "".to_string()),
+                            _ => panic!("Invalid namespace"),
+                        }
+                    }
+
+                    let (ns_name, item) = match (left.as_ref(), right.as_ref()) {
+                        (AstNode::Identifier(ns), AstNode::Identifier(item)) => (ns.clone(), item.clone()),
+                        (l, r) => {
+                            let (ns, rest) = flatten(l);
+                            let item = match r {
+                                AstNode::Identifier(s) => s.clone(),
+                                _ => panic!("Invalid namespace RHS"),
+                            };
+                            (ns, if rest.is_empty() { item } else { format!("{}::{}", rest, item) })
+                        }
+                    };
+
+                    let ns = ctx.namespaces.get(&ns_name)
+                        .unwrap_or_else(|| panic!("Unknown namespace '{}'", ns_name));
+
+                    // NORMAL FUNCTIONS
+                    if let Some(&idx) = ns.fn_map.get(&item) {
+                        return ctx.protos[idx].return_type.clone();
+                    }
+
+                    // NATIVE FUNCTIONS
+                    if let Some(entry) = ns.native_map.get(&item) {
+                        return entry.return_type.clone();
+                    }
+
+                    panic!("'{}::{}' is not callable", ns_name, item);
+                }
+                other => panic!("Identifier empty?")
             }
-            panic!("Identifier empty?");
         }
         AstNode::StructLiteral { name, generics, .. } => {
             if !generics.is_empty() {
@@ -591,6 +618,51 @@ fn type_of(ctx: &mut CompileCtx, node: &AstNode) -> VType
         AstNode::BinaryOp {op, left, right} => {
             match op.as_str() {
                 "+" => type_of(ctx, left),
+                "::" => {
+                    let ns_name = match left.as_ref() {
+                        AstNode::Identifier(n) => n,
+                        _ => panic!("Invalid namespace LHS: {:?}", left),
+                    };
+
+                    let ns = ctx.namespaces.get(ns_name)
+                        .unwrap_or_else(|| panic!("Unknown namespace '{}'", ns_name));
+
+                    match right.as_ref() {
+                        AstNode::Identifier(item) => {
+                            if let Some(&cidx) = ns.const_symbols.get(item) {
+                                return match &ctx.consts[cidx as usize] {
+                                    ConstValue::U8(_)    => VType::U8,
+                                    ConstValue::I8(_)    => VType::I8,
+                                    ConstValue::U16(_)   => VType::U16,
+                                    ConstValue::I16(_)   => VType::I16,
+                                    ConstValue::U32(_)   => VType::U32,
+                                    ConstValue::I32(_)   => VType::I32,
+                                    ConstValue::F32(_)   => VType::F32,
+                                    ConstValue::F64(_)   => VType::F64,
+                                    ConstValue::USize(_) => VType::USize,
+                                    ConstValue::Str(_)   => VType::String,
+                                    ConstValue::Bool(_)  => VType::Bool,
+                                    other => panic!("type_of(ns): unhandled const {:?}", other),
+                                };
+                            }
+
+                            if let Some(sym) = ns.symbols.get(item) {
+                                return sym.ty.clone();
+                            }
+
+                            if let Some(idx) = ns.fn_map.get(item) {
+                                return ctx.protos[*idx].return_type.clone();
+                            }
+                            
+                            if let Some(entry) = ns.native_map.get(item) {
+                                return entry.return_type.clone();
+                            }
+                            panic!("'{}::{}' not found", ns_name, item);
+                        }
+
+                        _ => panic!("Invalid namespace RHS: {:?}", right),
+                    }
+                }
                 "." => {
                     let left_ty = type_of(ctx, &*left);
 
@@ -648,6 +720,10 @@ pub fn compile_expr(ast: AstNode, ctx: &mut CompileCtx, reg: u32) -> Vec<Instruc
         }
         AstNode::Integer(n) => {
             let cidx = ctx.find_or_add_const(ConstValue::I32(n));
+            code.push(pack_i_abx(Opcode::LoadConst, reg, cidx));
+        }
+        AstNode::Double(n) => {
+            let cidx = ctx.find_or_add_const(ConstValue::F64(n));
             code.push(pack_i_abx(Opcode::LoadConst, reg, cidx));
         }
         AstNode::String(s) => {
@@ -732,6 +808,67 @@ pub fn compile_expr(ast: AstNode, ctx: &mut CompileCtx, reg: u32) -> Vec<Instruc
                 "||" => Opcode::LOr,
                 "&&" => Opcode::LAnd,
                 
+                "::" => {
+                    fn flatten(node: AstNode) -> (String, String) {
+                        match node {
+                            AstNode::BinaryOp { op, left, right } if op == "::" => {
+                                let (ns, rest) = flatten(*left);
+                                let rhs = match *right {
+                                    AstNode::Identifier(s) => s,
+                                    _ => panic!("Invalid namespace"),
+                                };
+                                (ns, format!("{}::{}", rest, rhs))
+                            }
+                            AstNode::Identifier(ns) => (ns, "".to_string()),
+                            _ => panic!("Invalid namespace"),
+                        }
+                    }
+
+                    let (ns_name, item) = match (*left, *right) {
+                        (AstNode::Identifier(ns), AstNode::Identifier(item)) => (ns, item),
+                        (l, r) => {
+                            let (ns, rest) = flatten(l);
+                            let item = match r {
+                                AstNode::Identifier(s) => s,
+                                _ => panic!("Invalid namespace RHS"),
+                            };
+                            (ns, if rest.is_empty() { item } else { format!("{}::{}", rest, item) })
+                        }
+                    };
+
+                    let ns = ctx.namespaces.get(&ns_name)
+                        .unwrap_or_else(|| panic!("Unknown namespace '{}'", ns_name));
+
+                    // FUNCTIONS
+                    if let Some(&idx) = ns.fn_map.get(&item) {
+                        let cidx = ctx.find_or_add_const(ConstValue::Function(idx));
+                        code.push(pack_i_abx(Opcode::LoadConst, reg, cidx));
+                        return code;
+                    }
+
+                    // CONSTS
+                    if let Some(&cidx) = ns.const_symbols.get(&item) {
+                        code.push(pack_i_abx(Opcode::LoadConst, reg, cidx));
+                        return code;
+                    }
+
+                    // TYPES / STRUCTS
+                    if let Some(sym) = ns.symbols.get(&item) {
+                        if sym.reg != reg {
+                            code.push(pack_i_abx(Opcode::Move, reg, sym.reg));
+                        }
+                        return code;
+                    }
+
+                    // NATIVE FUNCTIONS
+                    if let Some(entry) = ns.native_map.get(&item) {
+                        let cidx = ctx.find_or_add_const(ConstValue::NativeFunction(entry.global_idx));
+                        code.push(pack_i_abx(Opcode::LoadConst, reg, cidx));
+                        return code;
+                    }
+
+                    panic!("'{}' not found in namespace '{}'", item, ns_name);
+                }
                 "." => {
                     let struct_reg = ctx.regs.alloc();
                     code.extend(compile_expr(*left, ctx, struct_reg));
@@ -761,31 +898,49 @@ pub fn compile_expr(ast: AstNode, ctx: &mut CompileCtx, reg: u32) -> Vec<Instruc
             }
         }
         AstNode::Call { callee, args, generics } => {
-            let param_types: Vec<VType> = if let AstNode::Identifier(ref name) = *callee {
-                ctx.protos.iter()
-                    .find(|p| p.name == name.as_str())
-                    .map(|p| p.params.iter().map(|param| param.v_type.clone()).collect())
-                    .unwrap_or_default()
-            } else {
-                vec![]
+            let param_types: Vec<VType> = match callee.as_ref() {
+                AstNode::Identifier(name) => {
+                    ctx.protos.iter()
+                        .find(|p| p.name == name.as_str())
+                        .map(|p| p.params.iter().map(|param| param.v_type.clone()).collect())
+                        .unwrap_or_default()
+                }
+                AstNode::BinaryOp { op, left, right } if op == "::" => {
+                    let ns_name = match left.as_ref() {
+                        AstNode::Identifier(n) => n.as_str(),
+                        _ => "",
+                    };
+                    let fn_name = match right.as_ref() {
+                        AstNode::Identifier(n) => n.as_str(),
+                        _ => "",
+                    };
+                    ctx.namespaces.get(ns_name)
+                        .and_then(|ns| ns.native_map.get(fn_name))
+                        .map(|entry| entry.params.clone())
+                        .unwrap_or_default()
+                }
+                _ => vec![],
             };
 
+            // Compile callee into `reg`
             code.extend(compile_expr(*callee, ctx, reg));
 
+            // Allocate arg registers contiguously starting at reg+1
+            let arg_base = reg + 1;
             let mut arg_regs = vec![];
-            for _ in 0..args.len() {
-                arg_regs.push(ctx.regs.alloc());
+            for i in 0..args.len() {
+                arg_regs.push(arg_base + i as u32);
+                // Also bump the allocator so these regs aren't reused
+                ctx.regs.next = ctx.regs.next.max(arg_base + i as u32 + 1);
             }
-            
+
             for (i, arg) in args.into_iter().enumerate() {
                 let arg_reg = arg_regs[i];
                 let arg_ty = type_of(ctx, &arg);
                 code.extend(compile_expr(*arg, ctx, arg_reg));
 
                 if let Some(param_ty) = param_types.get(i) {
-                    //if &arg_ty != param_ty {
-                        coerce_type(&arg_ty, param_ty, ctx, arg_reg, &mut code);
-                    //}
+                    coerce_type(&arg_ty, param_ty, ctx, arg_reg, &mut code);
                 }
             }
 
@@ -1300,6 +1455,8 @@ fn compile_field_access_chain(left: AstNode, right: AstNode, ctx: &mut CompileCt
 pub fn resolve_import_exports<F>(
     program: &mut AstNode,
     ctx: &mut CompileCtx,
+    all_natives: &mut Vec<NativeFunction>,
+    mut native_modules: NativeModuleRegistry,
     read_file: F,
 ) -> Result<(), String>
 where
@@ -1324,6 +1481,12 @@ where
     let mut module_exports: HashMap<String, Vec<(String, AstNode)>> = HashMap::new();
 
     for (alias, path) in &imports {
+        if let Some(mut ns) = native_modules.remove(path) {
+            ns.name = alias.clone(); // user's alias wins
+            ctx.register_native_namespaces(all_natives, vec![ns]);
+            continue;
+        }
+
         let src = read_file(path)
             .map_err(|e| format!("import '{}': could not read file: {}", path, e))?;
 
@@ -1334,12 +1497,20 @@ where
 
         let exported = collect_module_exports(module_ast)?;
 
-        for (name, node) in &exported {
-            let ns_name = format!("{}::{}", alias, name);
-            inject_export_into_ctx(ctx, node.clone(), &ns_name)?;
+        let mut ns = Namespace {
+            symbols: HashMap::new(),
+            const_symbols: HashMap::new(),
+            fn_map: HashMap::new(),
+            native_map: HashMap::new(),
+        };
+        
+        let clone = exported.clone();
+        for (name, node) in exported {
+            inject_into_namespace(ctx, &mut ns, node, &name)?;
         }
-
-        module_exports.insert(alias.clone(), exported);
+        
+        ctx.namespaces.insert(alias.clone(), ns);
+        module_exports.insert(alias.clone(), clone); // use of moved value
     }
 
     for (module_alias, requested_items) in &uses {
@@ -1347,15 +1518,13 @@ where
             format!("`use {}`: no `import` with that alias found", module_alias)
         })?;
 
-        for item_name in requested_items {
-            let (_, item_node) = exports.iter()
-                .find(|(name, _)| name == item_name)
-                .ok_or_else(|| format!(
-                    "`use {}::({})`: '{}' was not exported by that module",
-                    module_alias, item_name, item_name
-                ))?;
+        let selected: Vec<(String, AstNode)> = exports.iter()
+            .filter(|(name, _)| requested_items.contains(name))
+            .cloned()
+            .collect();
 
-            inject_export_into_ctx(ctx, item_node.clone(), item_name)?;
+        for (item_name, item_node) in selected {
+            inject_export_into_ctx(ctx, item_node, &item_name)?;
         }
     }
 
@@ -1437,6 +1606,71 @@ fn export_name(node: &AstNode) -> Option<String> {
         }
         _ => None,
     }
+}
+
+pub fn inject_into_namespace(
+    ctx: &mut CompileCtx,
+    ns: &mut Namespace,
+    node: AstNode,
+    name: &str
+) -> Result<(), String> {
+    match node {
+        AstNode::Function { params, body, return_type, .. } => {
+            let mut func_ctx = CompileCtx::with_parent(ctx);
+
+            for param in &params {
+                let reg = func_ctx.regs.alloc();
+                func_ctx.add_symbol(param.ident.clone(), reg, param.v_type.clone());
+            }
+
+            let mut func_code = vec![];
+            for stmt in body {
+                compile_stmt(*stmt, &mut func_ctx, &mut func_code);
+            }
+
+            let proto_idx = ctx.protos.len();
+            ctx.protos.push(PrototypeFunction {
+                name: name.to_string(),
+                params,
+                code: func_code,
+                ctx: func_ctx,
+                return_type,
+            });
+
+            ns.fn_map.insert(name.to_string(), proto_idx);
+        }
+
+        AstNode::StructDecl { fields, struct_type, generics, .. } => {
+            let struct_idx = ctx.structs.len();
+
+            ctx.structs.push(StructPrototype {
+                name: name.to_string(),
+                fields: fields.into_iter().map(|p| (p.ident, p.v_type)).collect(),
+                struct_type: struct_type.clone(),
+                generics,
+            });
+
+            ns.symbols.insert(name.to_string(), Symbol {
+                name: name.to_string(),
+                reg: 0, // not used
+                ty: struct_type,
+            });
+        }
+
+        AstNode::Declaration { value, v_type, .. } => {
+            let reg = ctx.regs.alloc();
+            let mut code = vec![];
+            code.extend(compile_expr(*value, ctx, reg));
+
+            let idx = reg; // or const extraction if you want
+
+            ns.const_symbols.insert(name.to_string(), idx);
+        }
+
+        _ => return Err("Unsupported export".into()),
+    }
+
+    Ok(())
 }
 
 fn inject_export_into_ctx(ctx: &mut CompileCtx, node: AstNode, name: &str) -> Result<(), String> {

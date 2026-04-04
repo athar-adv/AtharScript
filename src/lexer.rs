@@ -50,7 +50,7 @@ fn keywords() -> &'static HashMap<&'static str, Token<'static>> {
     KEYWORDS.get_or_init(|| {
         let mut map = HashMap::new();
         map.insert("let", Token::DECLARE);
-        map.insert("function", Token::FN);
+        map.insert("fun", Token::FN);
         map.insert("return", Token::RETURN);
         map.insert("struct", Token::STRUCT);
         map.insert("if", Token::IF);
@@ -111,17 +111,6 @@ pub fn tokenize(src: String) -> Vec<Token<'static>> {
             while let Some(&next_char) = chars.peek() {
                 if next_char.is_alphanumeric() || next_char == '_' {
                     identifier.push(chars.next().unwrap());
-                } else if next_char == ':' {
-                    // check for '::'
-                    let mut clone_iter = chars.clone();
-                    clone_iter.next(); // skip first ':'
-                    if clone_iter.next() == Some(':') {
-                        chars.next(); // consume first ':'
-                        chars.next(); // consume second ':'
-                        identifier.push_str("::");
-                    } else {
-                        break;
-                    }
                 } else {
                     break;
                 }

@@ -1,5 +1,7 @@
 #![allow(unused)]
 
+//main.rs
+
 mod lexer;
 mod compiler;
 mod ast;
@@ -8,7 +10,7 @@ mod v_type;
 
 use lexer::tokenize;
 use ast::{parse, Parser};
-use compiler::{compile_stmt, resolve_import_exports, RegAlloc, CompileCtx};
+use compiler::{compile_stmt, resolve_import_exports, RegAlloc, CompileCtx, NativeNamespace, NativeModuleRegistry};
 use vm::{RuntimeValue, VM};
 use std::collections::HashMap;
 
@@ -20,7 +22,6 @@ use std::process;
 use crate::compiler::pack_i_abx;
 use crate::compiler::ConstValue;
 use crate::compiler::Opcode;
-use crate::compiler::TypeResolver;
 use crate::v_type::VType;
 use crate::vm::NativeFunction;
 
@@ -44,32 +45,39 @@ fn main() {
     let mut parser = Parser::new(tokens);
     let mut ast = parser.parse().unwrap();
 
-    // let mut loaded_modules_structs: HashMap<String, HashMap<String, VType>> = HashMap::new();
-
-    // let resolver = TypeResolver {
-    //     local_structs: &parser.defined_struct_types,
-    //     imported_structs: &loaded_modules_structs,
-    // };
-
-    // resolver.resolve_node(&mut ast).unwrap();
-
     println!("{:#?}", ast);
     
     let mut ctx = CompileCtx::new();
-    let native_fns: Vec<NativeFunction> = vec![
-        NativeFunction {
-            name: "print".into(),
-            func: |args| {
+    let mut all_natives = vec![];
+    
+    let mut native_modules: NativeModuleRegistry = HashMap::new();
+    
+    native_modules.insert("@std/math".into(),
+        NativeNamespace::new("math")
+            .register("floor", vec![VType::F64], VType::F64, |args| {
+                match &args[0] {
+                    RuntimeValue::F64(n) => RuntimeValue::F64(n.floor()),
+                    other => panic!("floor expects f64, got {:?}", other),
+                }
+            })
+            .register("ceil", vec![VType::F64], VType::F64, |args| {
+                match &args[0] {
+                    RuntimeValue::F64(n) => RuntimeValue::F64(n.ceil()),
+                    other => panic!("ceil expects f64, got {:?}", other),
+                }
+            })
+    );
+
+    native_modules.insert("@std/io".into(),
+        NativeNamespace::new("io")
+            .register("print", vec![VType::Auto], VType::Empty, |args| {
                 println!("{:?}", args[0]);
                 RuntimeValue::Empty
-            }
-        }
-    ];
-    
-    ctx.register_native_fns(&native_fns);
+            })
+    );
 
-    resolve_import_exports(&mut ast, &mut ctx, |path| {
-        std::fs::read_to_string(path).map_err(|e| e.to_string())
+    resolve_import_exports(&mut ast, &mut ctx, &mut all_natives, native_modules, |path| {
+        fs::read_to_string(path).map_err(|e| e.to_string())
     }).unwrap();
 
     let mut code = vec![];
@@ -84,7 +92,8 @@ fn main() {
     let main_proto_index = ctx.find_fn_addr_by_name("main")
         .expect("main function not found");
 
-    let mut vm = VM::new(native_fns, ctx.protos.clone(), ctx.structs, ctx.consts);
+    let mut vm = VM::new(all_natives, ctx.protos.clone(), ctx.structs, ctx.consts);
+
     vm.run_from_proto(main_proto_index);
 }
 
