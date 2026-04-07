@@ -10,7 +10,7 @@ mod v_type;
 
 use lexer::tokenize;
 use ast::{parse, Parser};
-use compiler::{compile_stmt, resolve_import_exports, RegAlloc, CompileCtx, NativeNamespace, NativeModuleRegistry};
+use compiler::{compile_stmt, resolve_import_exports, type_of, RegAlloc, CompileCtx, NativeNamespace, NativeModuleRegistry};
 use vm::{RuntimeValue, VM};
 use std::collections::HashMap;
 
@@ -23,7 +23,7 @@ use crate::compiler::pack_i_abx;
 use crate::compiler::ConstValue;
 use crate::compiler::Opcode;
 use crate::v_type::VType;
-use crate::vm::NativeFunction;
+use crate::vm::{NativeFunction, cast_value};
 
 fn main() {
     use std::{fs, process};
@@ -51,28 +51,59 @@ fn main() {
     let mut all_natives = vec![];
     
     let mut native_modules: NativeModuleRegistry = HashMap::new();
-    
+
     native_modules.insert("@std/math".into(),
         NativeNamespace::new("math")
-            .register("floor", vec![VType::F64], VType::F64, |args| {
+            .register("floor", vec![], vec![VType::F64], VType::F64, |_, args, _| {
                 match &args[0] {
                     RuntimeValue::F64(n) => RuntimeValue::F64(n.floor()),
                     other => panic!("floor expects f64, got {:?}", other),
                 }
             })
-            .register("ceil", vec![VType::F64], VType::F64, |args| {
+            .register("ceil",  vec![], vec![VType::F64], VType::F64, |_, args, _| {
                 match &args[0] {
                     RuntimeValue::F64(n) => RuntimeValue::F64(n.ceil()),
                     other => panic!("ceil expects f64, got {:?}", other),
                 }
             })
     );
-
+    
     native_modules.insert("@std/io".into(),
         NativeNamespace::new("io")
-            .register("print", vec![VType::Auto], VType::Empty, |args| {
-                println!("{:?}", args[0]);
-                RuntimeValue::Empty
+            .register("print", vec![], vec![VType::String], VType::Function(vec![], vec![VType::String], Box::new(VType::Auto)), |s, args, _| {
+                match &args[0] {
+                    RuntimeValue::Str(msg) => { print!("{}", msg); }
+                    other => panic!("Expected string, got {:?}", other)
+                }
+                s
+            })
+            .register("println", vec![], vec![VType::String], VType::Function(vec![], vec![VType::String], Box::new(VType::Auto)), |s, args, _| {
+                match &args[0] {
+                    RuntimeValue::Str(msg) => { println!("{}", msg); }
+                    other => panic!("Expected string, got {:?}", other)
+                }
+                s
+            })
+            .register("read", vec!["T"], vec![VType::String], VType::Generic("T".into()), |_, args, types| {
+                use std::io::{self, Write};
+
+                println!("{:?}", types);
+                match &args[0] {
+                    RuntimeValue::Str(msg) => { print!("{}", msg); io::stdout().flush().ok(); }
+                    other => panic!("Expected string, got {:?}", other)
+                }
+                let mut input = String::new();
+                io::stdin().read_line(&mut input).expect("Failed to read line");
+                let input = input.trim().to_string();
+
+                match types.first() {
+                    Some(VType::I32)    => RuntimeValue::I32(input.parse().expect("expected i32")),
+                    Some(VType::F64)    => RuntimeValue::F64(input.parse().expect("expected f64")),
+                    Some(VType::String) => RuntimeValue::Str(input),
+                    Some(VType::U8)     => RuntimeValue::U8(input.parse().expect("expected u8")),
+                    Some(VType::I64)    => RuntimeValue::I64(input.parse().expect("expected i64")),
+                    _                   => RuntimeValue::Str(input),
+                }
             })
     );
 

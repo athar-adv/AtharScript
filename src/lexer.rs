@@ -9,7 +9,8 @@ use std::sync::OnceLock;
 #[derive(Clone, Debug, PartialEq)]
 pub enum Token<'a> {
     STRING(&'a str),
-
+    FMTSTRING(&'a str),
+    
     INT(i32),
     FLOAT(f64),
 
@@ -20,12 +21,14 @@ pub enum Token<'a> {
 
     DECLARE,
     STRUCT,
+    IMPL,
     IDENT(&'a str),
 
     FN,
     RETURN,
     PUNCT(&'a str),
     ARROW,
+    LEFTARROW,
     END,
 
     // Control flow
@@ -41,6 +44,9 @@ pub enum Token<'a> {
     PUB,
     IMPORT,
     USE,
+
+    WHEN,
+    AS,
 }
 
 static KEYWORDS: OnceLock<HashMap<&'static str, Token<'static>>> = OnceLock::new();
@@ -64,6 +70,9 @@ fn keywords() -> &'static HashMap<&'static str, Token<'static>> {
         map.insert("pub", Token::PUB);
         map.insert("import", Token::IMPORT);
         map.insert("use", Token::USE);
+        map.insert("when", Token::WHEN);
+        map.insert("impl", Token::IMPL);
+        map.insert("as", Token::AS);
         map
     })
 }
@@ -155,6 +164,26 @@ pub fn tokenize(src: String) -> Vec<Token<'static>> {
         }
         
         match char {
+            '`' => {
+                let mut s = String::new();
+                let mut brace_depth = 0usize;
+
+                while let Some(&ch) = chars.peek() {
+                    chars.next();
+                    match ch {
+                        '{' => { brace_depth += 1; s.push(ch); }
+                        '}' => {
+                            if brace_depth > 0 { brace_depth -= 1; }
+                            s.push(ch);
+                        }
+                        '`' if brace_depth == 0 => break, // only close at depth 0
+                        '`' => s.push(ch),                // nested backtick inside { }, keep it
+                        _ => s.push(ch),
+                    }
+                }
+
+                tokens.push(Token::FMTSTRING(Box::leak(s.into_boxed_str())));
+            }
             '#' => {
                 while let Some(&next_char) = chars.peek() {
                     if next_char == '\n' {
@@ -295,19 +324,13 @@ pub fn tokenize(src: String) -> Vec<Token<'static>> {
             ']' => tokens.push(Token::PAREN("]")),
 
             '<' => {
-                // if chars.peek().map_or(false, |c| c == &'<') {
-                //     chars.next();
-                //     if chars.peek().map_or(false, |c| c == &'=') {
-                //         tokens.push(Token::BINOP("<<="));
-                //         chars.next();
-                //     } else {
-                //         tokens.push(Token::BINOP("<<"));
-                //     }
-                //     continue;
-                // }
-                // else
                 if chars.peek().map_or(false, |c| c == &'=') {
                     tokens.push(Token::BINOP("<="));
+                    chars.next();
+                    continue;
+                }
+                else if chars.peek().map_or(false, |c| c == &'-') {
+                    tokens.push(Token::LEFTARROW);
                     chars.next();
                     continue;
                 }

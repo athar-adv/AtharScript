@@ -1,23 +1,10 @@
-# input.luc
+# Lucy Programming Language: input.luc
 
-import module "./module.luc"
-import math "@std/math"
 import io "@std/io"
+use io {print, read, println as ln,println}
 
-use module {add, hi}
-
-pub var = 10
-pub struct bruh {
-    a: u8
-}
-
-pub fun new_bruh(a: u8)
+fun main() -> empty
 {
-    return bruh {a: a}
-}
-
-fun main()
-{
-    let v: i32 = math::floor(23.323 : f64)
-    io::print(v)
+    let val = real<u8>("Input!")
+    print(val)
 }

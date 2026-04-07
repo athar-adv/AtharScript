@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use crate::v_type::VType;
 use crate::vm::{NativeFunction, RuntimeValue};
-use crate::ast::{AstNode, Parameter, Parser};
+use crate::ast::{AstNode, Parameter, Parser, FmtPart};
 use crate::lexer::tokenize;
 
 #[derive(Debug, Clone)]
@@ -34,6 +34,7 @@ pub struct PrototypeFunction {
     pub code: Vec<Instruction>,
     pub ctx: CompileCtx,
     pub return_type: VType,
+    pub generics: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -49,12 +50,14 @@ pub struct NativeEntry {
     pub global_idx: usize,
     pub params: Vec<VType>,
     pub return_type: VType,
+    pub generic_names: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct StructPrototype {
     pub name: String,
-    pub fields: Vec<(String, VType)>,
+    pub fields: Vec<(String, VType)>, // actual data
+    pub methods: HashMap<String, usize>, // method index
     pub struct_type: VType,
     pub generics: Vec<String>
 }
@@ -70,8 +73,13 @@ fn substitute_type(ty: &VType, map: &HashMap<String, VType>) -> VType {
     match ty {
         VType::Generic(name) => {
             map.get(name)
-                .unwrap_or_else(|| panic!("Unbound generic '{}'", name))
-                .clone()
+                .cloned()
+                .unwrap_or_else(|| ty.clone())
+        }
+        VType::Unresolved(name) => {
+            map.get(name)
+                .cloned()
+                .unwrap_or_else(|| ty.clone())
         }
         VType::Struct(name, gens) => {
             VType::Struct(
@@ -107,7 +115,11 @@ fn instantiate_struct(
         .find(|s| s.name == base_name)
         .unwrap_or_else(|| panic!("Unknown struct '{}'", base_name))
         .clone();
-
+    if base.generics.is_empty() {
+        return ctx.structs.iter()
+            .position(|s| s.name == base_name)
+            .unwrap();
+    }
     if base.generics.len() != generic_args.len() {
         panic!("Generic arity mismatch for '{}'", base_name);
     }
@@ -124,14 +136,47 @@ fn instantiate_struct(
         .map(|(name, ty)| (name.clone(), substitute_type(ty, &subst)))
         .collect::<Vec<_>>();
 
+    let mut methods = HashMap::new();
+    for (name, fn_idx) in &base.methods {
+        let base_fn = ctx.protos[*fn_idx].clone();
+
+        let subst: HashMap<_, _> = base.generics.iter()
+            .cloned()
+            .zip(generic_args.iter().cloned())
+            .collect();
+
+        let new_params = base_fn.params.iter().map(|p| {
+            Parameter {
+                ident: p.ident.clone(),
+                v_type: substitute_type(&p.v_type, &subst),
+            }
+        }).collect::<Vec<_>>();
+
+        let new_return = substitute_type(&base_fn.return_type, &subst);
+        
+        let new_fn = PrototypeFunction {
+            name: format!("{}::{}", key, base_fn.name),
+            params: new_params,
+            code: base_fn.code.clone(),
+            ctx: base_fn.ctx.clone(),
+            return_type: new_return,
+            generics: vec![],
+        };
+
+        let new_idx = ctx.protos.len() - 1;
+        ctx.protos.push(new_fn);
+
+        methods.insert(name.clone(), new_idx);
+    }
     let new_proto = StructPrototype {
         name: key.clone(),
         fields,
         struct_type: VType::Struct(key.clone(), vec![]),
         generics: vec![],
+        methods,
     };
     
-    let new_idx = ctx.structs.len();
+    let new_idx = ctx.structs.len() - 1;
     ctx.structs.push(new_proto);
     ctx.struct_instances.insert(key, new_idx);
 
@@ -150,8 +195,14 @@ impl NativeNamespace {
         Self { name: name.to_string(), functions: vec![] }
     }
     
-    pub fn register(mut self, name: &str, params: Vec<VType>, return_type: VType, func: fn(&[RuntimeValue]) -> RuntimeValue) -> Self {
-        self.functions.push(NativeFunction { name: name.to_string(), func, params, return_type });
+    pub fn register(mut self, name: &str, generics: Vec<&str>, params: Vec<VType>, return_type: VType, func: fn(RuntimeValue, &[RuntimeValue], &[VType]) -> RuntimeValue) -> Self {
+        self.functions.push(NativeFunction {
+            name: name.to_string(),
+            func,
+            params,
+            return_type,
+            generic_names: generics.into_iter().map(|s| s.to_string()).collect(),
+        });
         self
     }
 }
@@ -219,8 +270,9 @@ impl CompileCtx {
                 let idx = all_natives.len(); // position in the VM's vec = the index
                 ns_map.native_map.insert(nf.name.clone(), NativeEntry {
                     global_idx: idx,
-                    params: nf.params,
-                    return_type: nf.return_type
+                    params: nf.params.clone(),
+                    return_type: nf.return_type.clone(),
+                    generic_names: nf.generic_names.clone(),
                 });
                 all_natives.push(clone);
             }
@@ -460,6 +512,18 @@ pub fn coerce_type(from: &VType, to: &VType, ctx: &mut CompileCtx, reg: u32, cod
             let type_const = ctx.find_or_add_const(ConstValue::Type(to.clone()));
             code.push(pack_i_abx(Opcode::Cast, reg, type_const));
         },
+        
+        // Tostring, emit a Cast instruction
+        (VType::U8  | VType::I8  |
+         VType::U16 | VType::I16 |
+         VType::U32 | VType::I32 |
+         VType::F32 | VType::F64 |
+         VType::USize,
+         VType::String) => {
+            let type_const = ctx.find_or_add_const(ConstValue::Type(to.clone()));
+            // Cast A Bx = R[A] = R[A] cast-to const[Bx]
+            code.push(pack_i_abx(Opcode::Cast, reg, type_const));
+        }
 
         // Numeric widening / narrowing — emit a Cast instruction
         (VType::U8  | VType::I8  |
@@ -474,7 +538,13 @@ pub fn coerce_type(from: &VType, to: &VType, ctx: &mut CompileCtx, reg: u32, cod
          VType::F32 | VType::F64 |
          VType::USize) => {
             let type_const = ctx.find_or_add_const(ConstValue::Type(to.clone()));
-            // Cast A Bx  →  R[A] = R[A] cast-to const[Bx]
+            // Cast A Bx = R[A] = R[A] cast-to const[Bx]
+            code.push(pack_i_abx(Opcode::Cast, reg, type_const));
+        }
+
+        (VType::String, VType::String) => {
+            let type_const = ctx.find_or_add_const(ConstValue::Type(to.clone()));
+            // Cast A Bx = R[A] = R[A] cast-to const[Bx]
             code.push(pack_i_abx(Opcode::Cast, reg, type_const));
         }
 
@@ -500,7 +570,7 @@ pub fn coerce_type(from: &VType, to: &VType, ctx: &mut CompileCtx, reg: u32, cod
     }
 }
 
-fn type_of(ctx: &mut CompileCtx, node: &AstNode) -> VType
+pub fn type_of(ctx: &mut CompileCtx, node: &AstNode) -> VType
 {
     match node {
         AstNode::TypeCast { value, ty } => {
@@ -512,18 +582,53 @@ fn type_of(ctx: &mut CompileCtx, node: &AstNode) -> VType
                 other => panic!("Cannot index into non-array type: {:?}", other),
             }
         }
+        AstNode::FmtString { .. } => VType::String,
         AstNode::String(..) => VType::String,
         AstNode::Integer(..) => VType::I32,
         AstNode::Double(..) => VType::F64,
         AstNode::Call {callee, args, generics} => {
             match callee.as_ref() {
+                AstNode::Call { callee, .. } => {
+                    let inner_ty = type_of(ctx, callee);
+
+                    match inner_ty {
+                        VType::Function(generics, params, return_type) => return VType::Function(generics, params, return_type),
+                        
+                        other => panic!("Trying to call non-function type: {:?}", other),
+                    }
+                }
                 AstNode::Identifier(name) => {
-                    let proto_idx = ctx.find_fn_addr_by_name(name.as_str())
-                    .unwrap_or_else(|| {
-                        panic!("unknown symbol")
-                    });
-                    let proto = &ctx.protos[proto_idx];
-                    return proto.return_type.clone();
+                    // Check protos first
+                    if let Some(proto) = ctx.protos.iter().find(|p| p.name == name.as_str()) {
+                        if proto.generics.is_empty() || generics.is_empty() {
+                            return proto.return_type.clone();
+                        }
+                        let subst: HashMap<String, VType> = proto.generics.iter()
+                            .cloned()
+                            .zip(generics.iter().cloned())
+                            .collect();
+                        return substitute_type(&proto.return_type, &subst);
+                    }
+
+                    for ns in ctx.namespaces.values() {
+                        if let Some(entry) = ns.native_map.get(name.as_str()) {
+                            if generics.is_empty() {
+                                return entry.return_type.clone();
+                            }
+                            let subst: HashMap<String, VType> = entry.generic_names.iter()
+                                .cloned()
+                                .zip(generics.iter().cloned())
+                                .collect();
+                            return substitute_type(&entry.return_type, &subst);
+                        }
+                    }
+
+                    // Fall back to Auto for natives registered via use (only idx known)
+                    if ctx.native_map.contains_key(name.as_str()) {
+                        return VType::Auto;
+                    }
+
+                    panic!("unknown symbol '{}'", name);
                 }
                 AstNode::BinaryOp {op, left, right} if op == "::" => {
                     fn flatten(node: &AstNode) -> (String, String) {
@@ -567,6 +672,53 @@ fn type_of(ctx: &mut CompileCtx, node: &AstNode) -> VType
                     }
 
                     panic!("'{}::{}' is not callable", ns_name, item);
+                }
+                AstNode::BinaryOp { op, left, right } if op == "." => {
+                    let left_ty = type_of(ctx, left);
+
+                    match left_ty {
+                        VType::Struct(name, generics) => {
+                            // resolve concrete struct if generic
+                            let struct_name = if !generics.is_empty() {
+                                let idx = instantiate_struct(ctx, &name, generics.clone());
+                                ctx.structs[idx].name.clone()
+                            } else {
+                                name.clone()
+                            };
+
+                            let proto = ctx.structs.iter()
+                                .find(|s| s.name == struct_name)
+                                .unwrap_or_else(|| panic!("Unknown struct '{}'", struct_name));
+
+                            let method_name = match right.as_ref() {
+                                AstNode::Identifier(s) => s,
+                                _ => panic!("Invalid method call RHS: {:?}", right),
+                            };
+
+                            if let Some(method_idx) = proto.methods.get(method_name) {
+                                let proto_fn = &ctx.protos[*method_idx];
+                                
+                                if proto_fn.generics.is_empty() || generics.is_empty() {
+                                    return proto_fn.return_type.clone();
+                                }
+
+                                let subst: HashMap<String, VType> = proto_fn.generics.iter()
+                                    .cloned()
+                                    .zip(generics.iter().cloned())
+                                    .collect();
+
+                                return substitute_type(&proto_fn.return_type, &subst);
+                            }
+
+                            if proto.fields.iter().any(|(f, _)| f == method_name) {
+                                panic!("Field '{}' is not callable", method_name);
+                            }
+
+                            panic!("Method '{}' not found in struct '{}'", method_name, struct_name);
+                        }
+
+                        other => panic!("Cannot call method on non-struct type: {:?}", other),
+                    }
                 }
                 other => panic!("Identifier empty?")
             }
@@ -897,12 +1049,54 @@ pub fn compile_expr(ast: AstNode, ctx: &mut CompileCtx, reg: u32) -> Vec<Instruc
                 code.push(pack_i_abx(Opcode::LNot, reg, reg))
             }
         }
+        AstNode::FmtString { parts } => {
+            if parts.is_empty() {
+                let cidx = ctx.find_or_add_const(ConstValue::Str(String::new()));
+                code.push(pack_i_abx(Opcode::LoadConst, reg, cidx));
+                return code;
+            }
+
+            // Load the first part into reg, then Add each subsequent part into it
+            let mut first = true;
+            for part in parts {
+                let part_reg = if first { reg } else { ctx.regs.alloc() };
+
+                match part {
+                    FmtPart::Literal(s) => {
+                        let cidx = ctx.find_or_add_const(ConstValue::Str(s));
+                        code.push(pack_i_abx(Opcode::LoadConst, part_reg, cidx));
+                    }
+                    FmtPart::Interpolated(expr) => {
+                        let expr_ty = type_of(ctx, &expr);
+                        code.extend(compile_expr(*expr, ctx, part_reg));
+                        
+                        coerce_type(&expr_ty, &VType::String, ctx, part_reg, &mut code);
+                    }
+                }
+
+                if !first {
+                    // reg = reg + part_reg  (string concat)
+                    code.push(pack_i_abc(Opcode::Add, reg, reg, part_reg));
+                }
+
+                first = false;
+            }
+        }
         AstNode::Call { callee, args, generics } => {
+            // Build param types with generics substituted
             let param_types: Vec<VType> = match callee.as_ref() {
                 AstNode::Identifier(name) => {
                     ctx.protos.iter()
                         .find(|p| p.name == name.as_str())
-                        .map(|p| p.params.iter().map(|param| param.v_type.clone()).collect())
+                        .map(|p| {
+                            let subst: HashMap<String, VType> = p.generics.iter()
+                                .cloned()
+                                .zip(generics.iter().cloned())
+                                .collect();
+                            p.params.iter()
+                                .map(|param| substitute_type(&param.v_type, &subst))
+                                .collect()
+                        })
                         .unwrap_or_default()
                 }
                 AstNode::BinaryOp { op, left, right } if op == "::" => {
@@ -912,25 +1106,131 @@ pub fn compile_expr(ast: AstNode, ctx: &mut CompileCtx, reg: u32) -> Vec<Instruc
                     };
                     let fn_name = match right.as_ref() {
                         AstNode::Identifier(n) => n.as_str(),
+                        AstNode::Call { callee, .. } => match callee.as_ref() {
+                            AstNode::Identifier(n) => n.as_str(),
+                            _ => "",
+                        },
                         _ => "",
                     };
+                    // For native namespace calls, substitute Generic params with call-site generics
                     ctx.namespaces.get(ns_name)
                         .and_then(|ns| ns.native_map.get(fn_name))
-                        .map(|entry| entry.params.clone())
+                        .map(|entry| {
+                            let subst: HashMap<String, VType> = entry.generic_names.iter()
+                                .cloned()
+                                .zip(generics.iter().cloned())
+                                .collect();
+                            entry.params.iter()
+                                .map(|p| substitute_type(p, &subst))
+                                .collect()
+                        })
                         .unwrap_or_default()
                 }
                 _ => vec![],
             };
 
-            // Compile callee into `reg`
-            code.extend(compile_expr(*callee, ctx, reg));
+            // Get the return type with generics substituted, for post-call coercion
+            let return_ty: Option<VType> = match callee.as_ref() {
+                AstNode::Identifier(name) => {
+                    ctx.protos.iter()
+                        .find(|p| p.name == name.as_str())
+                        .map(|p| {
+                            let subst: HashMap<String, VType> = p.generics.iter()
+                                .cloned()
+                                .zip(generics.iter().cloned())
+                                .collect();
+                            substitute_type(&p.return_type, &subst)
+                        })
+                }
+                AstNode::BinaryOp { op, left, right } if op == "::" => {
+                    let ns_name = match left.as_ref() {
+                        AstNode::Identifier(n) => n.as_str(),
+                        _ => "",
+                    };
+                    let fn_name = match right.as_ref() {
+                        AstNode::Identifier(n) => n.as_str(),
+                        AstNode::Call { callee, .. } => match callee.as_ref() {
+                            AstNode::Identifier(n) => n.as_str(),
+                            _ => "",
+                        },
+                        _ => "",
+                    };
+                    ctx.namespaces.get(ns_name)
+                        .and_then(|ns| ns.native_map.get(fn_name))
+                        .map(|entry| {
+                            let subst: HashMap<String, VType> = entry.generic_names.iter()
+                                .cloned()
+                                .zip(generics.iter().cloned())
+                                .collect();
+                            substitute_type(&entry.return_type, &subst)
+                        })
+                }
+                _ => None,
+            };
+            
+            match *callee {
+                AstNode::BinaryOp { op, left, right } if op == "." => {
+                    let self_reg = ctx.regs.alloc();
+                    let self_ty = type_of(ctx, &left);
 
-            // Allocate arg registers contiguously starting at reg+1
+                    code.extend(compile_expr(*left, ctx, self_reg));
+
+                    let (struct_name, generics) = match self_ty {
+                        VType::Struct(n, g) => (n, g),
+                        _ => panic!("Method call on non-struct"),
+                    };
+
+                    let struct_name = if !generics.is_empty() {
+                        let idx = instantiate_struct(ctx, &struct_name, generics.clone());
+                        ctx.structs[idx].name.clone()
+                    } else {
+                        struct_name
+                    };
+
+                    let proto = ctx.structs.iter()
+                        .find(|s| s.name == struct_name)
+                        .unwrap();
+
+                    let method_name = match *right {
+                        AstNode::Identifier(s) => s,
+                        _ => panic!("Invalid method call"),
+                    };
+
+                    let method_idx = proto.methods.get(&method_name)
+                        .unwrap_or_else(|| panic!("Method '{}' not found", method_name));
+
+                    let cidx = ctx.find_or_add_const(ConstValue::Function(*method_idx));
+                    code.push(pack_i_abx(Opcode::LoadConst, reg, cidx));
+
+                    let arg_base = reg + 1;
+
+                    code.push(pack_i_abx(Opcode::Move, arg_base, self_reg));
+                    let args_len = args.len();
+                    for (i, arg) in args.into_iter().enumerate() {
+                        let arg_reg = arg_base + 1 + i as u32;
+                        code.extend(compile_expr(*arg, ctx, arg_reg));
+                    }
+
+                    code.push(pack_i_abc(
+                        Opcode::Call,
+                        reg,
+                        (args_len + 1) as u32,
+                        generics.len() as u32
+                    ));
+
+                    return code;
+                }
+
+                _ => {
+                    code.extend(compile_expr(*callee, ctx, reg));
+                }
+            }
+
             let arg_base = reg + 1;
             let mut arg_regs = vec![];
-            for i in 0..args.len() {
+            let len = args.len();
+            for i in 0..len {
                 arg_regs.push(arg_base + i as u32);
-                // Also bump the allocator so these regs aren't reused
                 ctx.regs.next = ctx.regs.next.max(arg_base + i as u32 + 1);
             }
 
@@ -938,14 +1238,27 @@ pub fn compile_expr(ast: AstNode, ctx: &mut CompileCtx, reg: u32) -> Vec<Instruc
                 let arg_reg = arg_regs[i];
                 let arg_ty = type_of(ctx, &arg);
                 code.extend(compile_expr(*arg, ctx, arg_reg));
-
                 if let Some(param_ty) = param_types.get(i) {
                     coerce_type(&arg_ty, param_ty, ctx, arg_reg, &mut code);
                 }
             }
 
-            let num_args = arg_regs.len() as u32;
-            code.push(pack_i_abx(Opcode::Call, reg, num_args));
+            let type_arg_base = arg_base + len as u32;
+            for (i, ty) in generics.iter().enumerate() {
+                let type_reg = type_arg_base + i as u32;
+                ctx.regs.next = ctx.regs.next.max(type_reg + 1);
+                let cidx = ctx.find_or_add_const(ConstValue::Type(ty.clone()));
+                code.push(pack_i_abx(Opcode::LoadConst, type_reg, cidx));
+            }
+
+            code.push(pack_i_abc(Opcode::Call, reg, len as u32, generics.len() as u32));
+            
+            if let Some(ret_ty) = return_ty {
+                if !matches!(ret_ty, VType::Auto | VType::Empty) {
+                    let type_const = ctx.find_or_add_const(ConstValue::Type(ret_ty));
+                    code.push(pack_i_abx(Opcode::Cast, reg, type_const));
+                }
+            }
         }
         AstNode::StructLiteral { name, fields, generics } => {
             let struct_idx = if !generics.is_empty() {
@@ -1008,17 +1321,12 @@ pub fn compile_expr(ast: AstNode, ctx: &mut CompileCtx, reg: u32) -> Vec<Instruc
                 let elem_reg  = elem_regs[i];
                 let expr_type = type_of(ctx, &expr);
 
-                // Compile the element expression into its dedicated register.
                 code.extend(compile_expr(*expr, ctx, elem_reg));
 
-                // Coerce the element to the array's canonical element type if needed.
-                //if expr_type != elem_type {
-                    let mut coerce_code = vec![];
-                    coerce_type(&expr_type, &elem_type, ctx, elem_reg, &mut coerce_code);
-                    code.extend(coerce_code);
-                //}
+                let mut coerce_code = vec![];
+                coerce_type(&expr_type, &elem_type, ctx, elem_reg, &mut coerce_code);
+                code.extend(coerce_code);
 
-                // Emit the index constant and the SetArrayIdx instruction.
                 let idx_const = ctx.find_or_add_const(ConstValue::USize(i));
                 let idx_reg   = ctx.regs.alloc();
                 code.push(pack_i_abx(Opcode::LoadConst, idx_reg, idx_const));
@@ -1053,30 +1361,23 @@ fn resolve_field_access(node: &AstNode, ctx: &CompileCtx, struct_reg: &u32) -> u
 pub fn compile_stmt(ast: AstNode, ctx: &mut CompileCtx, code: &mut Vec<Instruction>) {
     match ast {
         AstNode::Export { item } => {
-            // Compile the inner item normally — the export flag is metadata
-            // for your module linker/loader to handle at a higher level.
-            // Mark it in ctx if you want runtime export tracking later.
             compile_stmt(*item, ctx, code);
         }
+        AstNode::Import { alias, path } => {}
+        AstNode::Use { module_alias, items } => {}
 
-        AstNode::Import { alias, path } => {
-            // Resolution happens before compilation (in a module loader).
-            // At compile time, just register the alias as a known namespace
-            // so `use` statements can reference it. No code emitted.
-        }
-
-        AstNode::Use { module_alias, items } => {
-            // At compile time, the module loader should have already merged
-            // exported symbols from `module_alias` into scope. 
-            // If you're doing single-pass compilation, this is a no-op here
-            // and the loader handles symbol injection before compile_stmt runs.
-        }
         AstNode::Assignment { assignee, value } => {
             match *assignee {
                 AstNode::Identifier(name) => {
                     if let Some(symbol) = ctx.find_symbol(&name) {
                         let target_reg = symbol.reg;
-                        code.extend(compile_expr(*value, ctx, target_reg));
+
+                        let value_reg = ctx.regs.alloc();
+                        code.extend(compile_expr(*value, ctx, value_reg));
+
+                        if value_reg != target_reg {
+                            code.push(pack_i_abx(Opcode::Move, target_reg, value_reg));
+                        }
                     } else {
                         panic!("Undefined variable: {}", name);
                     }
@@ -1097,13 +1398,11 @@ pub fn compile_stmt(ast: AstNode, ctx: &mut CompileCtx, code: &mut Vec<Instructi
                     code.extend(compile_expr(*value, ctx, value_reg));
                     let (struct_reg, field_indices) = compile_field_access_chain(*left, *right, ctx);
                     
-                    // For nested field access, need to traverse to the final struct
-                    // and then store to the final field
                     if field_indices.len() == 1 {
-                        // Simple case: struct.field = value
+                        // struct.field = value
                         code.push(pack_i_abc(Opcode::StoreStructField, struct_reg, field_indices[0] as u32, value_reg));
                     } else {
-                        // Complex case: struct.field1.field2 = value
+                        // struct.field1.field2 = value
                         let mut current_reg = struct_reg;
                         for &field_idx in &field_indices[..field_indices.len()-1] {
                             let next_reg = ctx.regs.alloc();
@@ -1120,45 +1419,92 @@ pub fn compile_stmt(ast: AstNode, ctx: &mut CompileCtx, code: &mut Vec<Instructi
             }
         }
         AstNode::Declaration { name, value, v_type } => {
-            let t = type_of(ctx, &value);
+            let inferred_ty = type_of(ctx, &value);
             
             if let AstNode::Identifier(name_str) = *name {
                 let reg = ctx.regs.alloc();
-                ctx.add_symbol(name_str.clone(), reg, v_type.clone());
+
+                let final_ty = match v_type {
+                    VType::Inferred => inferred_ty.clone(),
+                    _ => v_type.clone(),
+                };
+
+                ctx.add_symbol(name_str.clone(), reg, final_ty.clone());
+
                 code.extend(compile_expr(*value, ctx, reg));
 
-                //if t != v_type {
-                    coerce_type(&t, &v_type, ctx, reg, code);
-                //}
+                coerce_type(&inferred_ty, &final_ty, ctx, reg, code);
             } else {
                 panic!("Declaration: expected identifier as binding name, got {:?}", name);
             }
         }
 
-        AstNode::StructDecl { name, fields, struct_type , generics} => {
+        AstNode::StructDecl { name, fields, struct_type, generics, methods } => {
             let str_type = VType::Struct(name.clone(), vec![]);
-            let struct_idx = ctx.structs.len();
             let reg = ctx.regs.alloc();
-            ctx.add_symbol(name.clone(), reg, str_type.clone());
-            ctx.add_const(ConstValue::Struct(struct_idx));
 
             let mut actual_fields = Vec::new();
+            let mut method_map = HashMap::new();
+
             for p in fields {
-                actual_fields.push(
-                    (p.ident, p.v_type)
-                )
+                actual_fields.push((p.ident, p.v_type));
             }
 
-            let proto = StructPrototype {
-                name: name.clone(),
-                fields: actual_fields,
-                struct_type: str_type,
-                generics
-            };
-            ctx.structs.push(proto)
+            for m in methods {
+                let (name, node) = m;
+                if let AstNode::Function { name: fn_name, params, body, return_type, generics: fn_generics } = node {
+                    let mut new_params = vec![
+                        Parameter {
+                            ident: "self".to_string(),
+                            v_type: str_type.clone(),
+                        }
+                    ];
+
+                    new_params.extend(params);
+
+                    let mut sub_ctx = CompileCtx::with_parent(ctx);
+                    for param in &new_params {
+                        let r = sub_ctx.regs.alloc();
+                        sub_ctx.add_symbol(param.ident.clone(), r, param.v_type.clone());
+                    }
+
+                    let mut code = vec![];
+                    for stmt in body {
+                        compile_stmt(*stmt, &mut sub_ctx, &mut code);
+                    }
+
+                    let proto = PrototypeFunction {
+                        name: format!("{}::{}", name, fn_name),
+                        params: new_params,
+                        code,
+                        ctx: sub_ctx,
+                        return_type,
+                        generics: fn_generics,
+                    };
+
+                    let fn_idx = ctx.protos.len();
+                    ctx.protos.push(proto);
+
+                    method_map.insert(fn_name, fn_idx);
+                } else {
+                    panic!("Struct method is not a function");
+                }
+            }
+
+            let struct_idx = ctx.structs.iter()
+                .position(|s| s.name == name)
+                .expect("Struct should already be pre-registered");
+
+            let struct_proto = &mut ctx.structs[struct_idx];
+
+            struct_proto.fields = actual_fields;
+            struct_proto.methods = method_map;
+
+            ctx.add_symbol(name.clone(), reg, str_type.clone());
+            ctx.add_const(ConstValue::Struct(struct_idx));
         }
         
-        AstNode::Function { name, params, body, return_type } => {
+        AstNode::Function { name, params, body, return_type, generics } => {
             let mut func_ctx = CompileCtx::with_parent(ctx);
             
             for param in &params {
@@ -1168,23 +1514,33 @@ pub fn compile_stmt(ast: AstNode, ctx: &mut CompileCtx, code: &mut Vec<Instructi
 
             let proto_idx = ctx.protos.len();
             let reg = ctx.regs.alloc();
+
+            let mut param_types = vec![];
+            let mut generic_types = vec![];
+
+            for param in &params {
+                param_types.push(param.v_type.clone());
+            }
+            for name in &generics {
+                generic_types.push(VType::Generic(name.clone()));
+            }
             
-            ctx.add_symbol(name.clone(), reg, VType::Function);
+            ctx.add_symbol(name.clone(), reg, VType::Function(generic_types, param_types, Box::new(return_type.clone())));
             ctx.add_const(ConstValue::Function(proto_idx));
 
             let mut func_code = vec![];
             for stmt in body {
-               compile_stmt(*stmt, &mut func_ctx, &mut func_code);
+                compile_stmt(*stmt, &mut func_ctx, &mut func_code);
             }
 
-            let proto = PrototypeFunction {
+            ctx.protos.push(PrototypeFunction {
                 name: name.clone(),
-                params: params,
+                params,
                 code: func_code,
                 ctx: func_ctx,
                 return_type,
-            };
-            ctx.protos.push(proto);
+                generics,
+            });
         }
         
         AstNode::Call { callee, args, generics } => {
@@ -1211,10 +1567,47 @@ pub fn compile_stmt(ast: AstNode, ctx: &mut CompileCtx, code: &mut Vec<Instructi
             
             for (name, native_idx) in native_entries {
                 let reg = ctx.regs.alloc();
-                ctx.add_symbol(name.clone(), reg, VType::Function);
-                ctx.add_const(ConstValue::NativeFunction(native_idx));
+                for ns in ctx.namespaces.values() {
+                    if let Some(entry) = ns.native_map.get(name.as_str()) {
+                        let mut param_types = entry.params.clone();
+                        let return_type = Box::new(entry.return_type.clone());
+                        let mut generic_types = vec![];
+                        for v in &entry.generic_names {
+                            generic_types.push(VType::Generic(v.clone()));
+                        }
+                        ctx.add_symbol(name.clone(), reg, VType::Function(generic_types, param_types, return_type));
+                        ctx.find_or_add_const(ConstValue::NativeFunction(native_idx));
+                        break;
+                    }
+                }
             }
-            
+
+            for node in &nodes {
+                if let AstNode::StructDecl { name, generics, .. } = node {
+                    let struct_type = VType::Struct(name.clone(), vec![]);
+                    
+                    ctx.structs.push(StructPrototype {
+                        name: name.clone(),
+                        fields: vec![],
+                        methods: HashMap::new(),
+                        struct_type: struct_type.clone(),
+                        generics: generics.clone(),
+                    });
+                }
+            }
+
+            for node in &nodes {
+                if let AstNode::StructDecl { name, fields, .. } = node {
+                    let struct_proto = ctx.structs.iter_mut()
+                        .find(|s| s.name == *name)
+                        .unwrap();
+
+                    struct_proto.fields = fields.iter()
+                        .map(|p| (p.ident.clone(), p.v_type.clone()))
+                        .collect();
+                }
+            }
+
             for node in nodes {
                 compile_stmt(node.clone(), ctx, code);
             }
@@ -1351,6 +1744,81 @@ pub fn compile_stmt(ast: AstNode, ctx: &mut CompileCtx, code: &mut Vec<Instructi
                 }
             }
         }
+        AstNode::When { subject, arms } => {
+            let subject_reg = ctx.regs.alloc();
+            let subject_ty = type_of(ctx, &subject);
+            let cond_reg = ctx.regs.alloc();
+            code.extend(compile_expr(*subject, ctx, subject_reg));
+            
+            let mut end_jumps: Vec<usize> = vec![]; // positions to patch with jump-to-end
+
+            for arm in arms {
+                if arm.is_else {
+                    if let Some(binding_name) = arm.binding {
+                        ctx.add_symbol(binding_name, subject_reg, subject_ty.clone());
+                    }
+                    code.push(pack_i_abx(Opcode::BeginBlock, 0, 0));
+                    for stmt in arm.body {
+                        compile_stmt(*stmt, ctx, code);
+                    }
+                    code.push(pack_i_abx(Opcode::EndBlock, 0, 0));
+                    // no jump needed — else arm is last
+                } else {
+                    // compile each pattern as: cond_reg = (subject == pattern)
+                    // if multiple patterns, OR them together
+                    let mut pattern_jump_positions: Vec<usize> = vec![];
+
+                    for (i, pattern) in arm.patterns.iter().enumerate() {
+                        let pat_reg = ctx.regs.alloc();
+                        code.extend(compile_expr(pattern.clone(), ctx, pat_reg));
+
+                        // coerce pattern -> subject type BEFORE comparison
+                        let pat_ty = type_of(ctx, pattern);
+                        coerce_type(&pat_ty, &subject_ty, ctx, pat_reg, code);
+
+                        code.push(pack_i_abc(Opcode::Eq, cond_reg, subject_reg, pat_reg));
+
+                        if i < arm.patterns.len() - 1 {
+                            pattern_jump_positions.push(code.len());
+                            code.push(pack_i_abx(Opcode::Noop, 0, 0));
+                        }
+                    }
+
+                    // after last pattern, if no match jump to next arm
+                    let jump_to_next_pos = code.len();
+                    code.push(pack_i_abx(Opcode::Noop, 0, 0)); // patch with Jn to next arm
+
+                    // patch the short-circuit jumps to land here (start of body)
+                    let body_start = code.len() as u32;
+                    for pos in pattern_jump_positions {
+                        code[pos] = pack_i_abx(Opcode::Jmp, cond_reg, body_start);
+                    }
+
+                    code.push(pack_i_abx(Opcode::BeginBlock, 0, 0));
+                    for stmt in arm.body {
+                        compile_stmt(*stmt, ctx, code);
+                    }
+                    code.push(pack_i_abx(Opcode::EndBlock, 0, 0));
+
+                    // jump to end of entire when after successful arm
+                    end_jumps.push(code.len());
+                    code.push(pack_i_abx(Opcode::Noop, 0, 0)); // patch with Jmp to end
+
+                    // patch the "no match" jump to here (next arm)
+                    let next_arm = code.len() as u32;
+                    code[jump_to_next_pos] = pack_i_abx(Opcode::Jn, cond_reg, next_arm);
+                }
+            }
+
+            // patch all end-of-arm jumps to here
+            let end = code.len() as u32;
+            let true_const = ctx.find_or_add_const(ConstValue::Bool(true));
+            let always_reg = ctx.regs.alloc();
+            code.push(pack_i_abx(Opcode::LoadConst, always_reg, true_const));
+            for pos in end_jumps {
+                code[pos] = pack_i_abx(Opcode::Jmp, always_reg, end);
+            }
+        }
         AstNode::ConditionalBranch { condition, body, next } => {
             match condition {
                 Some(condition) => {
@@ -1412,7 +1880,6 @@ fn compile_field_access_chain(left: AstNode, right: AstNode, ctx: &mut CompileCt
     fn collect_field_indices(node: &AstNode, indices: &mut Vec<usize>, ctx: &CompileCtx) {
         match node {
             AstNode::Identifier(field_name) => {
-                // Find the field index - in a real implementation you'd want proper type tracking
                 for struct_proto in &ctx.structs {
                     if let Some(field_idx) = struct_proto.fields.iter()
                         .position(|(fname, _)| fname == field_name) 
@@ -1468,7 +1935,7 @@ where
     };
 
     let mut imports: Vec<(String, String)> = vec![];
-    let mut uses: Vec<(String, Vec<String>)> = vec![];
+    let mut uses: Vec<(String, Vec<(String, String)>)> = vec![];
 
     for node in nodes.iter() {
         match node {
@@ -1510,21 +1977,52 @@ where
         }
         
         ctx.namespaces.insert(alias.clone(), ns);
-        module_exports.insert(alias.clone(), clone); // use of moved value
+        module_exports.insert(alias.clone(), clone);
     }
 
     for (module_alias, requested_items) in &uses {
+        // Native namespace, pull requested items into top-level scope
+        if ctx.namespaces.contains_key(module_alias) {
+            let entries: Vec<((String, String), NativeEntry)> = {
+                let ns = ctx.namespaces.get(module_alias).unwrap();
+                requested_items.iter()
+                    .filter_map(|item| {
+                        let (name, alias) = item;
+                        ns.native_map.get(name).map(|entry| (item.clone(), entry.clone()))
+                    })
+                    .collect()
+            };
+
+            for (item, entry) in entries {
+                let (name, alias) = item;
+                ctx.native_map.insert(alias.clone(), entry.global_idx);
+                let reg = ctx.regs.alloc();
+
+                let mut param_types = entry.params.clone();
+                let return_type = Box::new(entry.return_type.clone());
+                let mut generic_types = vec![];
+                for v in &entry.generic_names {
+                    generic_types.push(VType::Generic(v.clone()));
+                }
+
+                ctx.add_symbol(alias.clone(), reg, VType::Function(
+                    generic_types, param_types, return_type
+                ));
+                ctx.find_or_add_const(ConstValue::NativeFunction(entry.global_idx));
+            }
+            continue;
+        }
+        
         let exports = module_exports.get(module_alias).ok_or_else(|| {
             format!("`use {}`: no `import` with that alias found", module_alias)
         })?;
-
-        let selected: Vec<(String, AstNode)> = exports.iter()
-            .filter(|(name, _)| requested_items.contains(name))
-            .cloned()
-            .collect();
-
-        for (item_name, item_node) in selected {
-            inject_export_into_ctx(ctx, item_node, &item_name)?;
+        
+        for (export_name, node) in exports {
+            if let Some((_, alias)) = requested_items.iter()
+                .find(|(req, _)| req == export_name)
+            {
+                inject_export_into_ctx(ctx, node.clone(), alias)?;
+            }
         }
     }
 
@@ -1615,7 +2113,7 @@ pub fn inject_into_namespace(
     name: &str
 ) -> Result<(), String> {
     match node {
-        AstNode::Function { params, body, return_type, .. } => {
+        AstNode::Function { params, body, return_type, generics, .. } => {
             let mut func_ctx = CompileCtx::with_parent(ctx);
 
             for param in &params {
@@ -1634,25 +2132,48 @@ pub fn inject_into_namespace(
                 params,
                 code: func_code,
                 ctx: func_ctx,
+                generics,
                 return_type,
             });
 
             ns.fn_map.insert(name.to_string(), proto_idx);
         }
 
-        AstNode::StructDecl { fields, struct_type, generics, .. } => {
-            let struct_idx = ctx.structs.len();
+        AstNode::StructDecl { name, fields, struct_type, generics, methods } => {
+            let struct_idx = ctx.structs.len() - 1;
+
+            let mut actual_fields = Vec::new();
+            let mut method_map = HashMap::new();
+
+            for p in fields {
+                actual_fields.push((p.ident, p.v_type));
+            }
+
+            // methods (ONLY register indices here, assume already compiled elsewhere)
+            for m in methods {
+                let (name, node) = m;
+                if let AstNode::Function { name: fn_name, .. } = node {
+                    let fn_idx = ctx.protos.iter()
+                        .position(|p| p.name == format!("{}::{}", name, fn_name))
+                        .unwrap_or_else(|| panic!("Method '{}' not compiled", fn_name));
+
+                    method_map.insert(fn_name, fn_idx);
+                } else {
+                    panic!("Struct method is not a function");
+                }
+            }
 
             ctx.structs.push(StructPrototype {
                 name: name.to_string(),
-                fields: fields.into_iter().map(|p| (p.ident, p.v_type)).collect(),
+                fields: actual_fields,
+                methods: method_map,
                 struct_type: struct_type.clone(),
                 generics,
             });
 
             ns.symbols.insert(name.to_string(), Symbol {
                 name: name.to_string(),
-                reg: 0, // not used
+                reg: 0,
                 ty: struct_type,
             });
         }
@@ -1662,7 +2183,7 @@ pub fn inject_into_namespace(
             let mut code = vec![];
             code.extend(compile_expr(*value, ctx, reg));
 
-            let idx = reg; // or const extraction if you want
+            let idx = reg; // or const extraction
 
             ns.const_symbols.insert(name.to_string(), idx);
         }
@@ -1675,7 +2196,7 @@ pub fn inject_into_namespace(
 
 fn inject_export_into_ctx(ctx: &mut CompileCtx, node: AstNode, name: &str) -> Result<(), String> {
     match node {
-        AstNode::Function { params, body, return_type, .. } => {
+        AstNode::Function { params, body, return_type, generics, .. } => {
             if ctx.find_fn_addr_by_name(name).is_some() { return Ok(()); }
 
             let mut func_ctx = CompileCtx::with_parent(ctx);
@@ -1689,27 +2210,62 @@ fn inject_export_into_ctx(ctx: &mut CompileCtx, node: AstNode, name: &str) -> Re
 
             let proto_idx = ctx.protos.len();
             let reg = ctx.regs.alloc();
-            ctx.add_symbol(name.to_string(), reg, VType::Function);
+
+            let mut param_types = vec![];
+            let mut generic_types = vec![];
+
+            for param in &params {
+                param_types.push(param.v_type.clone());
+            }
+            for name in &generics {
+                generic_types.push(VType::Generic(name.clone()));
+            }
+
+            ctx.add_symbol(name.to_string(), reg, VType::Function(generic_types, param_types, Box::new(return_type.clone())));
             ctx.find_or_add_const(ConstValue::Function(proto_idx));
             ctx.protos.push(PrototypeFunction {
                 name: name.to_string(),
                 params,
                 code: func_code,
                 ctx: func_ctx,
+                generics,
                 return_type,
             });
         }
 
-        AstNode::StructDecl { fields, struct_type, generics, .. } => {
+        AstNode::StructDecl { name, fields, struct_type, generics, methods, .. } => {
             if ctx.structs.iter().any(|s| s.name == name) { return Ok(()); }
 
-            let struct_idx = ctx.structs.len();
+            let struct_idx = ctx.structs.len() - 1;
             let reg = ctx.regs.alloc();
+
             ctx.add_symbol(name.to_string(), reg, VType::Struct(name.to_string(), vec![]));
             ctx.add_const(ConstValue::Struct(struct_idx));
+
+            let mut actual_fields = Vec::new();
+            let mut method_map = HashMap::new();
+            
+            for p in fields {
+                actual_fields.push((p.ident, p.v_type));
+            }
+
+            for m in methods {
+                let (name, node) = m;
+                if let AstNode::Function { name: fn_name, .. } = node {
+                    let fn_idx = ctx.protos.iter()
+                        .position(|p| p.name == format!("{}::{}", name, fn_name))
+                        .unwrap_or_else(|| panic!("Method '{}' not compiled", fn_name));
+
+                    method_map.insert(fn_name, fn_idx);
+                } else {
+                    panic!("Struct method is not a function");
+                }
+            }
+
             ctx.structs.push(StructPrototype {
                 name: name.to_string(),
-                fields: fields.into_iter().map(|p| (p.ident, p.v_type)).collect(),
+                fields: actual_fields,
+                methods: method_map,
                 struct_type,
                 generics,
             });

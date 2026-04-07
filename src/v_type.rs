@@ -16,15 +16,18 @@ pub enum VType {
     Bool,
     String,
     Unresolved(String),
+    Inferred,
     Struct(String, Vec<VType>), // Proto name, instantiated generics
-    Function,
+    Function(Vec<VType>, Vec<VType>, Box<VType>), // Generics, params, return
     Generic(String), // name
+    Type(Box<VType>),
     Ref(
         Box<VType>
     ),
     Array(
         Box<VType>,
     ),
+    Namespace,
     Auto
 }
 
@@ -64,7 +67,7 @@ pub fn vty_from_str(name: &str) -> Result<VType, String> {
         "f32" => Ok(VType::F32),
         "f64" => Ok(VType::F64),
         "empty" => Ok(VType::Empty),
-        "function" => Ok(VType::Function),
+        "fun" => Ok(VType::Function(vec![], vec![], Box::new(VType::Empty))),
         "boolean" => Ok(VType::Bool),
         "string" => Ok(VType::String),
         "usize" => Ok(VType::USize),
@@ -103,11 +106,10 @@ impl PartialEq for VType {
             (VType::U64, VType::U64) => true,
             (VType::F64, VType::F64) => true,
             (VType::USize, VType::USize) => true,
-            (VType::Function, VType::Function) => true,
+            (VType::Function(..), VType::Function(..)) => true,
             (VType::Empty, VType::Empty) => true,
             (VType::Bool, VType::Bool) => true,
             (VType::String, VType::String) => true,
-            (VType::Function, VType::Function) => true,
             _ => false,
         }
     }
