@@ -1,1013 +1,795 @@
-//vm.rs
+#![allow(unused)]
 
-use crate::compiler::{coerce_type, ConstValue, Instruction, Opcode, PrototypeFunction, StructPrototype, A_SHIFT, B_SHIFT, C_SHIFT, OPCODE_BITS};
-use crate::compiler::ConstValue as CV;
-use crate::VType;
+use crate::ty::Type;
+use crate::operator::Operator;
 
-#[derive(Debug, Clone)]
-pub enum StackSlot {
-    Struct(StructInstance),
-    Array(Vec<RuntimeValue>),
-    Empty
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
+
+#[derive(Clone, Debug)]
+pub enum UpvalueCellInner {
+    Open(usize),          // index into flat register array
+    Closed(RuntimeValue), // captured after enclosing frame returned
+}
+
+#[derive(Clone, Debug)]
+pub struct UpvalueCell(pub Rc<RefCell<UpvalueCellInner>>);
+
+impl UpvalueCell {
+    fn new_open(reg: usize) -> Self {
+        Self(Rc::new(RefCell::new(UpvalueCellInner::Open(reg))))
+    }
+    fn close(&self, value: RuntimeValue) {
+        *self.0.borrow_mut() = UpvalueCellInner::Closed(value);
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Closure {
+    pub proto_idx: usize,
+    pub upvalues:  Vec<UpvalueCell>,
+}
+
+impl PartialEq for Closure {
+    fn eq(&self, other: &Self) -> bool { self.proto_idx == other.proto_idx }
+}
+
+#[derive(Debug)]
+pub struct NativeFunctionProto {
+    pub name:  String,
+    pub arity: u8,
+    pub func:  fn(args: Vec<RuntimeValue>) -> RuntimeValue,
 }
 
 #[derive(Debug, Clone)]
+pub enum UpvalueSource {
+    ParentRegister(usize),
+    ParentUpvalue(usize),
+}
+
+#[derive(Debug, Clone)]
+pub struct UpvalueDescriptor {
+    pub name:   String,
+    pub source: UpvalueSource,
+    pub ty:     Type,
+}
+
+pub struct FunctionProto {
+    pub name:          String,
+    pub arity:         u8,
+    pub max_regs:      u8,
+    pub code:          Vec<u32>,
+    pub constants:     Vec<ConstantValue>,
+    pub protos:        Vec<FunctionProto>,
+    pub upvalues:      Vec<UpvalueDescriptor>,
+    pub saved_reg_top: usize,
+}
+
+#[repr(u32)]
+pub enum Opcode {
+    LOADK,
+    CALL,
+    RET,
+    MOVE,
+    GETUPVAL,
+
+    JEQ,
+    JNE,
+    JMP,
+
+    NEWCLASS,
+    SETFIELD,
+    GETFIELD,
+    GETMETHOD,
+
+    ADD,
+    SUB,
+    MUL,
+    DIV,
+    POW,
+    MOD,
+
+    LOR,
+    LAND,
+
+    BOR,
+    BAND,
+    BLSHIFT,
+    BRSHIFT,
+
+    EQ,
+    NEQ,
+    LE,
+    LT,
+    GE,
+    GT,
+    
+    NEG,
+    LNOT,
+    BNOT,
+
+    //
+    ADDOV,
+    SUBOV,
+    MULOV,
+    DIVOV,
+    POWOV,
+    MODOV,
+
+    LOROV,
+    LANDOV,
+
+    BOROV,
+    BANDOV,
+    BLSHIFTOV,
+    BRSHIFTOV,
+
+    EQOV,
+    NEQOV,
+    LEOV,
+    LTOV,
+    GEOV,
+    GTOV,
+    
+    NEGOV,
+    LNOTOV,
+    BNOTOV,
+
+    TYCAST,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ConstantValue {
+    U8(u8), I8(i8),
+    U16(u16), I16(i16),
+    U32(u32), I32(i32),
+    U64(u64), I64(i64),
+    F32(f32), F64(f64),
+
+    String(String),
+    Type(Type),
+    FunctionProto(usize),
+    NativeFunctionProto(usize),
+
+    ClassProto {
+        name: String,
+        fields: Vec<bool>,
+        methods: Vec<(usize, bool)>,
+        operators: HashMap<Operator, usize>
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ClassInstance {
+    pub class_name: String,
+
+    pub field_values: Vec<RuntimeValue>,
+    pub field_visibility: Vec<bool>,
+
+    pub method_table: Vec<(usize, bool)>,
+    pub operator_table: HashMap<Operator, usize>,
+}
+
+impl PartialEq for ClassInstance {
+    fn eq(&self, other: &Self) -> bool { Rc::ptr_eq(&Rc::new(()), &Rc::new(())) }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub enum RuntimeValue {
-    U8(u8),
-    I8(i8),
+    U8(u8), I8(i8),
+    U16(u16), I16(i16),
+    U32(u32), I32(i32),
+    U64(u64), I64(i64),
+    F32(f32), F64(f64),
 
-    U16(u16),
-    I16(i16),
+    String(String),
+    Type(Type),
+    Closure(Closure),
+    NativeClosure(usize),
 
-    U32(u32),
-    I32(i32),
-
-    F32(f32),
-    F64(f64),
-
-    U64(u64),
-    I64(i64),
-
-    Str(String),
-    USize(usize),
-    Bool(bool),
-
-    Ptr(VType, usize, bool),
-
-    Function(usize),
-    Struct(usize),
-    Array(Vec<RuntimeValue>),
-    NativeFunction(usize),
-
-    Type(VType),
+    /// A heap-allocated class instance (shared via Rc<RefCell<...>>).
+    Instance(Rc<RefCell<ClassInstance>>),
 
     Empty,
 }
 
-#[derive(Debug, Clone)]
-pub struct StructInstance {
-    struct_idx: usize,
-    concrete_type: Vec<VType>,
-    fields: Vec<RuntimeValue>,
+impl RuntimeValue {
+    /// Coerce to f64 for arithmetic.
+    pub fn as_f64(&self) -> f64 {
+        match self {
+            RuntimeValue::U8(n)  => *n as f64,
+            RuntimeValue::I8(n)  => *n as f64,
+            RuntimeValue::U16(n) => *n as f64,
+            RuntimeValue::I16(n) => *n as f64,
+            RuntimeValue::U32(n) => *n as f64,
+            RuntimeValue::I32(n) => *n as f64,
+            RuntimeValue::U64(n) => *n as f64,
+            RuntimeValue::I64(n) => *n as f64,
+            RuntimeValue::F32(n) => *n as f64,
+            RuntimeValue::F64(n) => *n,
+            other => panic!("Cannot coerce {:?} to number", other),
+        }
+    }
+
+    /// True when the value is an integer kind (not float).
+    pub fn is_integer(&self) -> bool {
+        matches!(self,
+            RuntimeValue::U8(_)  | RuntimeValue::I8(_)  |
+            RuntimeValue::U16(_) | RuntimeValue::I16(_) |
+            RuntimeValue::U32(_) | RuntimeValue::I32(_) |
+            RuntimeValue::U64(_) | RuntimeValue::I64(_)
+        )
+    }
+
+    /// True when the value is a float kind.
+    pub fn is_float(&self) -> bool {
+        matches!(self, RuntimeValue::F32(_) | RuntimeValue::F64(_))
+    }
+
+    /// Perform arithmetic, preserving the "wider" numeric type of the two operands.
+    pub fn arith(lhs: &RuntimeValue, rhs: &RuntimeValue, op: u32) -> RuntimeValue {
+        // Float promotion: if either side is a float, use f64 arithmetic
+        if lhs.is_float() || rhs.is_float() {
+            let l = lhs.as_f64();
+            let r = rhs.as_f64();
+            let result = match op {
+                x if x == Opcode::ADD as u32 => l + r,
+                x if x == Opcode::SUB as u32 => l - r,
+                x if x == Opcode::MUL as u32 => l * r,
+                x if x == Opcode::DIV as u32 => l / r,
+                x if x == Opcode::POW as u32 => l.powf(r),
+                x if x == Opcode::MOD as u32 => l % r,
+                _ => unreachable!(),
+            };
+            // Preserve F32 if both inputs were F32
+            if matches!(lhs, RuntimeValue::F32(_)) && matches!(rhs, RuntimeValue::F32(_)) {
+                return RuntimeValue::F32(result as f32);
+            }
+            return RuntimeValue::F64(result);
+        }
+
+        // Integer arithmetic — use i64 as working type, then down-cast to the left-hand type
+        let l = lhs.as_f64() as i64;
+        let r = rhs.as_f64() as i64;
+        let result: i64 = match op {
+            x if x == Opcode::ADD as u32 => l.wrapping_add(r),
+            x if x == Opcode::SUB as u32 => l.wrapping_sub(r),
+            x if x == Opcode::MUL as u32 => l.wrapping_mul(r),
+            x if x == Opcode::MOD as u32 => l % r,
+            x if x == Opcode::POW as u32 => l.wrapping_pow(r as u32),
+            x if x == Opcode::BLSHIFT as u32 => l.wrapping_shl(r as u32),
+            x if x == Opcode::BRSHIFT as u32 => l.wrapping_shr(r as u32),
+            x if x == Opcode::DIV as u32 => {
+                if r == 0 { panic!("Integer division by zero"); }
+                l.wrapping_div(r)
+            }
+            _ => unreachable!(),
+        };
+        // Mirror the left-hand type
+        match lhs {
+            RuntimeValue::U8(_)  => RuntimeValue::U8(result as u8),
+            RuntimeValue::I8(_)  => RuntimeValue::I8(result as i8),
+            RuntimeValue::U16(_) => RuntimeValue::U16(result as u16),
+            RuntimeValue::I16(_) => RuntimeValue::I16(result as i16),
+            RuntimeValue::U32(_) => RuntimeValue::U32(result as u32),
+            RuntimeValue::I32(_) => RuntimeValue::I32(result as i32),
+            RuntimeValue::U64(_) => RuntimeValue::U64(result as u64),
+            RuntimeValue::I64(_) => RuntimeValue::I64(result),
+            _ => unreachable!(),
+        }
+    }
 }
 
-#[derive(Debug, Clone)]
-pub struct NativeFunction {
-    pub name: String,
-    pub func: fn(RuntimeValue, &[RuntimeValue], &[VType]) -> RuntimeValue,
-    pub params: Vec<VType>,
-    pub return_type: VType,
-    pub generic_names: Vec<String>,
+pub fn pack_abc(op: u32, a: u32, b: u32, c: u32) -> u32 {
+    (op & 0x3F) | ((a & 0xFF) << 6) | ((b & 0x1FF) << 14) | ((c & 0x1FF) << 23)
 }
-
-#[derive(Debug)]
+pub fn pack_abx(op: u32, a: u32, bx: u32) -> u32 {
+    (op & 0x3F) | ((a & 0xFF) << 6) | ((bx & 0x3FFFF) << 14)
+}
+pub fn unpack_abc(instruction: u32) -> (u32, u32, u32, u32) {
+    let op = instruction & 0x3F;
+    let a  = (instruction >> 6)  & 0xFF;
+    let b  = (instruction >> 14) & 0x1FF;
+    let c  = (instruction >> 23) & 0x1FF;
+    (op, a, b, c)
+}
+pub fn unpack_abx(instruction: u32) -> (u32, u32, u32) {
+    let op = instruction & 0x3F;
+    let a  = (instruction >> 6)  & 0xFF;
+    let bx = (instruction >> 14) & 0x3FFFF;
+    (op, a, bx)
+}
+pub fn opu32(o: Opcode) -> u32 { o as u32 }
 pub struct CallFrame {
-    proto_index: usize,     // which prototype we're running
-    pc: usize,              // instruction pointer in that proto
-    regs: Vec<RuntimeValue>, // registers for this frame (register 0..N)
-    stack_base: usize,
-    local_var_bases: Vec<usize>,
+    pub closure:    Closure,
+    pub pc:         usize,
+    pub base_reg:   usize,
+    pub return_reg: usize,
 }
 
-fn resolve_type(
-    ty: &VType,
-    concrete: &[VType],
-    generic_names: &[String]
-) -> VType {
-    match ty {
-        VType::Generic(name) => {
-            let idx = generic_names.iter()
-                .position(|g| g == name)
-                .expect("Generic not found");
-
-            concrete.get(idx)
-                .cloned()
-                .expect("Missing concrete generic type")
-        }
-        VType::Array(inner) => {
-            VType::Array(Box::new(
-                resolve_type(inner, concrete, generic_names)
-            ))
-        }
-        VType::Struct(name, generics) => {
-            VType::Struct(
-                name.clone(),
-                generics.iter()
-                    .map(|g| resolve_type(g, concrete, generic_names))
-                    .collect()
-            )
-        }
-        VType::Function(generics, params, return_type) => VType::Function(generics.clone(), params.clone(), return_type.clone()),
-        
-        // everything else
-        other => other.clone(),
-    }
+pub struct LucyVM {
+    pub protos:        Vec<FunctionProto>,
+    pub native_protos: Vec<NativeFunctionProto>,
+    pub registers:     Vec<RuntimeValue>,
+    pub call_stack:    Vec<CallFrame>,
+    pub open_upvalues: Vec<UpvalueCell>,
 }
 
-fn assert_not_moved(val: &RuntimeValue) {
-    if let RuntimeValue::Ptr(_, _, moved) = val {
-        if *moved {
-            panic!("Use after move");
-        }
-    }
-}
-
-fn move_value(val: &mut RuntimeValue) -> RuntimeValue {
-    match val {
-        RuntimeValue::Ptr(ty, idx, moved) => {
-            if *moved {
-                panic!("Double move detected");
-            }
-            *moved = true;
-            RuntimeValue::Ptr(ty.clone(), *idx, false)
-        }
-        _ => val.clone()
-    }
-}
-
-fn drop_value(vm: &mut VM, val: RuntimeValue) {
-    match val {
-        RuntimeValue::Ptr(_, _, moved) if moved => {
-            // already moved → DO NOTHING
-        }
-        RuntimeValue::Ptr(_, idx, _) => {
-            if idx < vm.stack.len() {
-                let slot = std::mem::replace(&mut vm.stack[idx], StackSlot::Empty);
-                drop_slot(vm, slot);
-            }
-        }
-        RuntimeValue::Array(arr) => {
-            for v in arr {
-                drop_value(vm, v);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn drop_slot(vm: &mut VM, slot: StackSlot) {
-    match slot {
-        StackSlot::Struct(s) => {
-            for field in s.fields {
-                drop_value(vm, field);
-            }
-        }
-        StackSlot::Array(arr) => {
-            for val in arr {
-                drop_value(vm, val);
-            }
-        }
-        StackSlot::Empty => {}
-    }
-}
-
-macro_rules! apply_binop {
-    ($left:expr, $right:expr, $op:tt) => {
-        match ($left, $right) {
-            (RuntimeValue::I32(l),   RuntimeValue::I32(r))   => RuntimeValue::I32(l $op r),
-            (RuntimeValue::U32(l),   RuntimeValue::U32(r))   => RuntimeValue::U32(l $op r),
-            (RuntimeValue::I8(l),    RuntimeValue::I8(r))    => RuntimeValue::I8(l $op r),
-            (RuntimeValue::U8(l),    RuntimeValue::U8(r))    => RuntimeValue::U8(l $op r),
-            (RuntimeValue::I16(l),   RuntimeValue::I16(r))   => RuntimeValue::I16(l $op r),
-            (RuntimeValue::U16(l),   RuntimeValue::U16(r))   => RuntimeValue::U16(l $op r),
-            (RuntimeValue::USize(l), RuntimeValue::USize(r)) => RuntimeValue::USize(l $op r),
-            (RuntimeValue::F32(l),   RuntimeValue::F32(r))   => RuntimeValue::F32(l $op r),
-            (RuntimeValue::F64(l),   RuntimeValue::F64(r))   => RuntimeValue::F64(l $op r),
-            (RuntimeValue::Str(l), RuntimeValue::Str(r)) => RuntimeValue::Str(format!("{}{}", l, r)),
-            (l, r) => panic!("Binary operation applied to incompatible operands: {:?} {:?}", l, r),
-        }
-    };
-}
-
-fn can_cast_type(from: &VType, to: &VType) -> bool {
-    if from == to {
-        return true;
-    }
-
-    match (from, to) {
-        // ── unsigned widening / narrowing ─────────────────────────────
-        (VType::U8,  VType::U16 | VType::U32 | VType::U64 | VType::I16 | VType::I32 | VType::I64 | VType::USize | VType::F32 | VType::F64) => true,
-        (VType::U16, VType::U32 | VType::U64 | VType::I32 | VType::I64 | VType::USize | VType::F32 | VType::F64 | VType::U8 | VType::I16) => true,
-        (VType::U32, VType::U64 | VType::I32 | VType::I64 | VType::USize | VType::F32 | VType::F64 | VType::U8 | VType::U16 | VType::I16) => true,
-        (VType::U64, VType::F32 | VType::F64 | VType::USize | VType::I64) => true,
-
-        // ── signed widening / narrowing ───────────────────────────────
-        (VType::I8,  VType::I16 | VType::I32 | VType::I64 | VType::F32 | VType::F64 | VType::U8 | VType::U16 | VType::U32 | VType::U64) => true,
-        (VType::I16, VType::I32 | VType::I64 | VType::F32 | VType::F64 | VType::U8 | VType::U16 | VType::U32 | VType::U64 | VType::I8) => true,
-        (VType::I32, VType::I64 | VType::F32 | VType::F64 | VType::U8 | VType::U16 | VType::U32 | VType::U64 | VType::I8 | VType::I16) => true,
-        (VType::I64, VType::F32 | VType::F64 | VType::U8 | VType::U16 | VType::U32 | VType::U64 | VType::I8 | VType::I16 | VType::I32) => true,
-
-        // ── floats ────────────────────────────────────────────────────
-        (VType::F32, VType::F64 | VType::I32 | VType::U32 | VType::I64 | VType::U64 | VType::I8 | VType::U8 | VType::USize) => true,
-        (VType::F64, VType::F32 | VType::I32 | VType::U32 | VType::I64 | VType::U64 | VType::I8 | VType::U8 | VType::USize) => true,
-
-        (VType::USize, VType::I32 | VType::U32 | VType::U64 | VType::F32 | VType::F64 | VType::U8 | VType::U16) => true,
-
-        // ── arrays / structs ─────────────────────────────────────────
-        (VType::Array(a), VType::Array(b)) => can_cast_type(a, b),
-        (VType::Struct(n1, g1), VType::Struct(n2, g2)) => n1 == n2 && g1 == g2,
-
-        _ => false,
-    }
-}
-
-fn cast_runtime_value(val: RuntimeValue, to: &VType) -> RuntimeValue {
-    match (val, to) {
-        (v, VType::Auto) => v,
-        
-        (RuntimeValue::Ptr(VType::Array(from), idx, _), VType::Array(to)) => {
-            if can_cast_type(&from, to) {
-                RuntimeValue::Ptr(VType::Array(to.clone()), idx, false)
-            } else {
-                panic!("Array element type mismatch: {:?} -> {:?}", from, to)
-            }
-        }
-        (RuntimeValue::Ptr(VType::Struct(name1, g1), idx, _), VType::Struct(name2, g2)) => {
-            if name1 == *name2 && g1 == *g2 {
-                RuntimeValue::Ptr(VType::Struct(name2.clone(), g2.clone()), idx, false)
-            } else {
-                panic!("Struct type mismatch: {:?} -> {:?}", name1, name2)
-            }
-        }
-        
-        // ── identity ──────────────────────────────────────────────────────────
-        (RuntimeValue::I32(n),  VType::I32)   => RuntimeValue::I32(n),
-        (RuntimeValue::U8(n),   VType::U8)    => RuntimeValue::U8(n),
-        (RuntimeValue::I8(n),   VType::I8)    => RuntimeValue::I8(n),
-        (RuntimeValue::U16(n),  VType::U16)   => RuntimeValue::U16(n),
-        (RuntimeValue::I16(n),  VType::I16)   => RuntimeValue::I16(n),
-        (RuntimeValue::U32(n),  VType::U32)   => RuntimeValue::U32(n),
-        (RuntimeValue::F32(n),  VType::F32)   => RuntimeValue::F32(n),
-        (RuntimeValue::F64(n),  VType::F64)   => RuntimeValue::F64(n),
-        (RuntimeValue::U64(n),  VType::U64)   => RuntimeValue::U64(n),
-        (RuntimeValue::I64(n),  VType::I64)   => RuntimeValue::I64(n),
-        (RuntimeValue::USize(n),VType::USize) => RuntimeValue::USize(n),
-        (RuntimeValue::Str(n),  VType::String)   => RuntimeValue::Str(n),
-
-        // ── unsigned widening / narrowing ─────────────────────────────────────
-        (RuntimeValue::U8(n),  VType::U16)  => RuntimeValue::U16(n as u16),
-        (RuntimeValue::U8(n),  VType::U32)  => RuntimeValue::U32(n as u32),
-        (RuntimeValue::U8(n),  VType::I32)  => RuntimeValue::I32(n as i32),
-        (RuntimeValue::U8(n),  VType::I16)  => RuntimeValue::I16(n as i16),
-        (RuntimeValue::U8(n),  VType::USize)=> RuntimeValue::USize(n as usize),
-        (RuntimeValue::U8(n),  VType::F32)  => RuntimeValue::F32(n as f32),
-        (RuntimeValue::U8(n),  VType::F64)  => RuntimeValue::F64(n as f64),
-        (RuntimeValue::U8(n),  VType::U64)   => RuntimeValue::U64(n as u64),
-        (RuntimeValue::U8(n),  VType::I64)   => RuntimeValue::I64(n as i64),
-        (RuntimeValue::U8(n),  VType::String)   => RuntimeValue::Str(n.to_string()),
-
-        (RuntimeValue::U16(n), VType::U32)  => RuntimeValue::U32(n as u32),
-        (RuntimeValue::U16(n), VType::I32)  => RuntimeValue::I32(n as i32),
-        (RuntimeValue::U16(n), VType::USize)=> RuntimeValue::USize(n as usize),
-        (RuntimeValue::U16(n), VType::F32)  => RuntimeValue::F32(n as f32),
-        (RuntimeValue::U16(n), VType::F64)  => RuntimeValue::F64(n as f64),
-        (RuntimeValue::U16(n), VType::U8)   => RuntimeValue::U8(n as u8),   // narrowing
-        (RuntimeValue::U16(n), VType::I16)  => RuntimeValue::I16(n as i16),
-        (RuntimeValue::U16(n),  VType::U64)   => RuntimeValue::U64(n as u64),
-        (RuntimeValue::U16(n),  VType::I64)   => RuntimeValue::I64(n as i64),
-        (RuntimeValue::U16(n),  VType::String)   => RuntimeValue::Str(n.to_string()),
-
-        (RuntimeValue::U32(n), VType::USize)=> RuntimeValue::USize(n as usize),
-        (RuntimeValue::U32(n), VType::F32)  => RuntimeValue::F32(n as f32),
-        (RuntimeValue::U32(n), VType::F64)  => RuntimeValue::F64(n as f64),
-        (RuntimeValue::U32(n), VType::I32)  => RuntimeValue::I32(n as i32),
-        (RuntimeValue::U32(n), VType::U8)   => RuntimeValue::U8(n as u8),
-        (RuntimeValue::U32(n), VType::U16)  => RuntimeValue::U16(n as u16),
-        (RuntimeValue::U32(n), VType::I16)  => RuntimeValue::I16(n as i16),
-        (RuntimeValue::U32(n),  VType::U64)   => RuntimeValue::U64(n as u64),
-        (RuntimeValue::U32(n),  VType::I64)   => RuntimeValue::I64(n as i64),
-        (RuntimeValue::U32(n),  VType::String)   => RuntimeValue::Str(n.to_string()),
-
-        (RuntimeValue::U8(n),  VType::U64) => RuntimeValue::U64(n as u64),
-        (RuntimeValue::U16(n), VType::U64) => RuntimeValue::U64(n as u64),
-        (RuntimeValue::U32(n), VType::U64) => RuntimeValue::U64(n as u64),
-        (RuntimeValue::U64(n), VType::USize) => RuntimeValue::USize(n as usize),
-        (RuntimeValue::U64(n), VType::F32)   => RuntimeValue::F32(n as f32),
-        (RuntimeValue::U64(n), VType::F64)   => RuntimeValue::F64(n as f64),
-        (RuntimeValue::U64(n), VType::I64)   => RuntimeValue::I64(n as i64),
-        (RuntimeValue::U64(n),  VType::String)   => RuntimeValue::Str(n.to_string()),
-
-        // ── signed widening / narrowing ───────────────────────────────────────
-        (RuntimeValue::I8(n),  VType::I16)  => RuntimeValue::I16(n as i16),
-        (RuntimeValue::I8(n),  VType::I32)  => RuntimeValue::I32(n as i32),
-        (RuntimeValue::I8(n),  VType::F32)  => RuntimeValue::F32(n as f32),
-        (RuntimeValue::I8(n),  VType::F64)  => RuntimeValue::F64(n as f64),
-        (RuntimeValue::I8(n),  VType::U8)   => RuntimeValue::U8(n as u8),
-        (RuntimeValue::I8(n),  VType::U16)  => RuntimeValue::U16(n as u16),
-        (RuntimeValue::I8(n),  VType::U32)  => RuntimeValue::U32(n as u32),
-        (RuntimeValue::I8(n),  VType::U64)   => RuntimeValue::U64(n as u64),
-        (RuntimeValue::I8(n),  VType::I64)   => RuntimeValue::I64(n as i64),
-        (RuntimeValue::I8(n),  VType::String)   => RuntimeValue::Str(n.to_string()),
-
-        (RuntimeValue::I16(n), VType::I32)  => RuntimeValue::I32(n as i32),
-        (RuntimeValue::I16(n), VType::F32)  => RuntimeValue::F32(n as f32),
-        (RuntimeValue::I16(n), VType::F64)  => RuntimeValue::F64(n as f64),
-        (RuntimeValue::I16(n), VType::U8)   => RuntimeValue::U8(n as u8),
-        (RuntimeValue::I16(n), VType::U16)  => RuntimeValue::U16(n as u16),
-        (RuntimeValue::I16(n), VType::U32)  => RuntimeValue::U32(n as u32),
-        (RuntimeValue::I16(n), VType::I8)   => RuntimeValue::I8(n as i8),
-        (RuntimeValue::I16(n),  VType::U64)   => RuntimeValue::U64(n as u64),
-        (RuntimeValue::I16(n),  VType::I64)   => RuntimeValue::I64(n as i64),
-        (RuntimeValue::I16(n),  VType::String)   => RuntimeValue::Str(n.to_string()),
-
-        (RuntimeValue::I32(n), VType::I8)   => RuntimeValue::I8(n as i8),
-        (RuntimeValue::I32(n), VType::I16)  => RuntimeValue::I16(n as i16),
-        (RuntimeValue::I32(n), VType::U8)   => RuntimeValue::U8(n as u8),
-        (RuntimeValue::I32(n), VType::U16)  => RuntimeValue::U16(n as u16),
-        (RuntimeValue::I32(n), VType::U32)  => RuntimeValue::U32(n as u32),
-        (RuntimeValue::I32(n), VType::F32)  => RuntimeValue::F32(n as f32),
-        (RuntimeValue::I32(n), VType::F64)  => RuntimeValue::F64(n as f64),
-        (RuntimeValue::I32(n), VType::USize)=> RuntimeValue::USize(n as usize),
-        (RuntimeValue::I32(n),  VType::U64)   => RuntimeValue::U64(n as u64),
-        (RuntimeValue::I32(n),  VType::I64)   => RuntimeValue::I64(n as i64),
-        (RuntimeValue::I32(n),  VType::String)   => RuntimeValue::Str(n.to_string()),
-
-        (RuntimeValue::I8(n),  VType::I64) => RuntimeValue::I64(n as i64),
-        (RuntimeValue::I16(n), VType::I64) => RuntimeValue::I64(n as i64),
-        (RuntimeValue::I32(n), VType::I64) => RuntimeValue::I64(n as i64),
-        (RuntimeValue::I64(n), VType::F32) => RuntimeValue::F32(n as f32),
-        (RuntimeValue::I64(n), VType::F64) => RuntimeValue::F64(n as f64),
-        (RuntimeValue::I64(n), VType::I32) => RuntimeValue::I32(n as i32),
-        (RuntimeValue::I64(n), VType::U32) => RuntimeValue::U32(n as u32),
-        (RuntimeValue::I64(n), VType::U64) => RuntimeValue::U64(n as u64),
-        (RuntimeValue::I64(n),  VType::String)   => RuntimeValue::Str(n.to_string()),
-
-        // ── float conversions ─────────────────────────────────────────────────
-        (RuntimeValue::F32(n), VType::F64)  => RuntimeValue::F64(n as f64),
-        (RuntimeValue::F32(n), VType::I32)  => RuntimeValue::I32(n as i32),
-        (RuntimeValue::F32(n), VType::U32)  => RuntimeValue::U32(n as u32),
-        (RuntimeValue::F32(n), VType::I8)   => RuntimeValue::I8(n as i8),
-        (RuntimeValue::F32(n), VType::U8)   => RuntimeValue::U8(n as u8),
-        (RuntimeValue::F32(n), VType::USize)=> RuntimeValue::USize(n as usize),
-        (RuntimeValue::F32(n),  VType::U64)   => RuntimeValue::U64(n as u64),
-        (RuntimeValue::F32(n),  VType::I64)   => RuntimeValue::I64(n as i64),
-        (RuntimeValue::F32(n),  VType::String)   => RuntimeValue::Str(n.to_string()),
-
-        (RuntimeValue::F64(n), VType::F32)  => RuntimeValue::F32(n as f32),
-        (RuntimeValue::F64(n), VType::I32)  => RuntimeValue::I32(n as i32),
-        (RuntimeValue::F64(n), VType::U32)  => RuntimeValue::U32(n as u32),
-        (RuntimeValue::F64(n), VType::I8)   => RuntimeValue::I8(n as i8),
-        (RuntimeValue::F64(n), VType::U8)   => RuntimeValue::U8(n as u8),
-        (RuntimeValue::F64(n), VType::USize)=> RuntimeValue::USize(n as usize),
-        (RuntimeValue::F64(n),  VType::U64)   => RuntimeValue::U64(n as u64),
-        (RuntimeValue::F64(n),  VType::I64)   => RuntimeValue::I64(n as i64),
-        (RuntimeValue::F64(n),  VType::String)   => RuntimeValue::Str(n.to_string()),
-
-        // ── usize ─────────────────────────────────────────────────────────────
-        (RuntimeValue::USize(n), VType::I32)  => RuntimeValue::I32(n as i32),
-        (RuntimeValue::USize(n), VType::U32)  => RuntimeValue::U32(n as u32),
-        (RuntimeValue::USize(n), VType::U8)   => RuntimeValue::U8(n as u8),
-        (RuntimeValue::USize(n), VType::U16)  => RuntimeValue::U16(n as u16),
-        (RuntimeValue::USize(n), VType::F32)  => RuntimeValue::F32(n as f32),
-        (RuntimeValue::USize(n), VType::F64)  => RuntimeValue::F64(n as f64),
-        (RuntimeValue::USize(n),  VType::U64)   => RuntimeValue::U64(n as u64),
-        (RuntimeValue::USize(n),  VType::I64)   => RuntimeValue::I64(n as i64),
-        (RuntimeValue::USize(n),  VType::String)   => RuntimeValue::Str(n.to_string()),
-
-        (RuntimeValue::Str(v), VType::String) => RuntimeValue::Str(v),
-        
-        (src, target) => panic!(
-            "cast_runtime_value: no cast defined from {:?} to {:?}",
-            src, target
-        ),
-    }
-}
-
-pub fn cast_value(val: RuntimeValue, to: &VType, stack: &mut [StackSlot]) -> RuntimeValue {
-    match val {
-        RuntimeValue::Ptr(VType::Array(_), stack_idx, moved) => {
-            match to {
-                VType::Array(to_ty) => {
-                    let old_elements = match std::mem::replace(&mut stack[stack_idx], StackSlot::Array(vec![])) {
-                        StackSlot::Array(vec) => vec,
-                        _ => panic!("Ptr does not point to an array at index {}", stack_idx),
-                    };
-
-                    let new_elements: Vec<RuntimeValue> = old_elements
-                        .into_iter()
-                        .map(|elem| cast_value(elem, to_ty, stack))
-                        .collect();
-
-                    stack[stack_idx] = StackSlot::Array(new_elements);
-                    RuntimeValue::Ptr(VType::Array(Box::new(*to_ty.clone())), stack_idx, moved)
-                }
-                VType::Auto => {
-                    RuntimeValue::Ptr(VType::Array(Box::new(VType::Auto)), stack_idx, moved)
-                }
-                other => panic!("Cannot cast array pointer to non-array type: {:?}", other),
-            }
-        }
-
-        RuntimeValue::Ptr(VType::Struct(name1, g1), idx, moved) => {
-            match to {
-                VType::Auto => {
-                    RuntimeValue::Ptr(VType::Struct(name1, g1), idx, moved)
-                }
-                VType::Struct(name2, g2) => {
-                    if &name1 == name2 && &g1 == g2 {
-                        RuntimeValue::Ptr(VType::Struct(name2.clone(), g2.clone()), idx, moved)
-                    } else {
-                        panic!("Struct type mismatch: {:?} -> {:?}", name1, name2);
-                    }
-                }
-                other => panic!("Cannot cast struct pointer to {:?}", other),
-            }
-        }
-
-        other => cast_runtime_value(other, to),
-    }
-}
-
-#[derive(Debug)]
-pub struct VM {
-    pub native_functions: Vec<NativeFunction>,
-    pub protos: Vec<PrototypeFunction>, // prototypes compiled earlier
-    pub struct_protos: Vec<StructPrototype>,
-    pub consts: Vec<ConstValue>,        // top-level constant pool (if any)
-    pub frames: Vec<CallFrame>,         // call stack
-    pub frame_regs: usize,
-    pub stack: Vec<StackSlot>,
-    pub block_stack_bases: Vec<usize>,
-}
-
-impl VM {
-    pub fn new(native_functions: Vec<NativeFunction>, protos: Vec<PrototypeFunction>, struct_protos: Vec<StructPrototype>, consts: Vec<ConstValue>) -> Self {
+impl LucyVM {
+    pub fn new() -> Self {
         Self {
-            native_functions,
-            protos,
-            struct_protos,
-            consts,
-            frames: Vec::new(),
-            frame_regs: 256,
-            stack: Vec::new(),
-            block_stack_bases: Vec::new()
+            protos:        vec![],
+            native_protos: vec![],
+            registers:     vec![RuntimeValue::Empty; 512],
+            call_stack:    vec![],
+            open_upvalues: vec![],
         }
+    }
+
+    pub fn load_proto(&mut self, proto: FunctionProto) -> usize {
+        self.load_proto_recursive(proto)
     }
     
-   fn get_struct_mut(&mut self, stack_idx: usize) -> &mut StructInstance {
-        match self.stack.get_mut(stack_idx) {
-            Some(StackSlot::Struct(s)) => s,
-            _ => panic!("Invalid struct stack index: {}", stack_idx),
+    fn load_proto_recursive(&mut self, mut proto: FunctionProto) -> usize {
+        let nested: Vec<FunctionProto> = std::mem::take(&mut proto.protos);
+
+        let mut remap: Vec<(usize, usize)> = Vec::new();
+        let mut flat_indices: Vec<usize> = Vec::new();
+
+        for (local_idx, nested_proto) in nested.into_iter().enumerate() {
+            let flat_idx = self.load_proto_recursive(nested_proto);
+            remap.push((local_idx, flat_idx));
+            flat_indices.push(flat_idx);
         }
-    }
 
-    fn get_struct(&self, stack_idx: usize) -> &StructInstance {
-        match self.stack.get(stack_idx) {
-            Some(StackSlot::Struct(s)) => s,
-            _ => panic!("Invalid struct stack index: {}", stack_idx),
+        Self::apply_remap_to_constants(&mut proto.constants, &remap);
+        for &flat_idx in &flat_indices {
+            Self::apply_remap_to_constants(&mut self.protos[flat_idx].constants, &remap);
         }
+
+        let idx = self.protos.len();
+        self.protos.push(proto);
+        idx
     }
 
-    fn cleanup_stack(&mut self, stack_base: usize) {
-        while self.stack.len() > stack_base {
-            let slot = self.stack.pop().unwrap();
-            drop_slot(self, slot);
-        }
-    }
-
-    fn is_valid_struct_ptr(&self, stack_idx: usize) -> bool {
-        stack_idx < self.stack.len()
-    }
-
-    pub fn run_from_proto(&mut self, main_proto_index: usize) {
-        self.push_frame(main_proto_index);
-        while !self.frames.is_empty() {
-            let top_idx = self.frames.len() - 1;
-            {
-                let frame = &mut self.frames[top_idx];
-                let proto = &self.protos[frame.proto_index];
-                
-                if frame.pc >= proto.code.len() {
-                    // proto ended: implicit return (empty)
-                    self.pop_frame_and_propagate(None);
-                    continue;
+    fn apply_remap_to_constants(constants: &mut Vec<ConstantValue>, remap: &[(usize, usize)]) {
+        for c in constants.iter_mut() {
+            for &(local_idx, flat_idx) in remap {
+                match c {
+                    ConstantValue::FunctionProto(idx) if *idx == local_idx => {
+                        *idx = flat_idx;
+                    }
+                    ConstantValue::ClassProto { methods, .. } => {
+                        for (idx, _) in methods.iter_mut() {
+                            if *idx == local_idx {
+                                *idx = flat_idx;
+                            }
+                        }
+                    }
+                    _ => {}
                 }
+            }
+        }
+    }
 
-                let instr = proto.code[frame.pc];
-                frame.pc += 1;
+    pub fn call_closure(&mut self, closure: Closure, args: Vec<RuntimeValue>) -> RuntimeValue {
+        let base_reg = 0;
+        for (i, arg) in args.into_iter().enumerate() {
+            self.registers[base_reg + i] = arg;
+        }
+        self.call_stack.push(CallFrame {
+            closure,
+            pc: 0,
+            base_reg,
+            return_reg: 0,
+        });
+        self.run()
+    }
 
-                let opcode = instr & ((1 << OPCODE_BITS) - 1);
-                let a = ((instr >> A_SHIFT) & 0xFF) as usize;
-                let bx = (instr >> B_SHIFT) as usize;
-                
-                let b = ((instr >> B_SHIFT) & 0x1FF) as usize;
-                let c = ((instr >> C_SHIFT) & 0x1FF) as usize;
-                
-                //prI32ln!("{:?}", Opcode::try_from(opcode).unwrap());
-                
-                match opcode {
-                    x if x == Opcode::LoadConst as u32 => {
-                        let const_val = proto.ctx.consts.get(bx)
-                            .cloned()
-                            .or_else(|| self.consts.get(bx).cloned())
-                            .expect(&format!("LoadConst: OOB bx={} proto={}", bx, frame.proto_index));
-                        
-                        frame.regs[a] = match const_val {
-                            CV::U8(n) => RuntimeValue::U8(n),
-                            CV::I8(n) => RuntimeValue::I8(n),
-                            CV::U16(n) => RuntimeValue::U16(n),
-                            CV::I16(n) => RuntimeValue::I16(n),
-                            CV::U32(n) => RuntimeValue::U32(n),
-                            CV::I32(n) => RuntimeValue::I32(n),
-                            CV::U64(n) => RuntimeValue::U64(n),
-                            CV::I64(n) => RuntimeValue::I64(n),
-                            CV::F32(n) => RuntimeValue::F32(n),
-                            CV::F64(n) => RuntimeValue::F64(n),
-                            CV::Bool(b) => RuntimeValue::Bool(b),
-                            CV::Empty => RuntimeValue::Empty,
-                            CV::USize(n) => RuntimeValue::USize(n),
-                            CV::Str(s) => RuntimeValue::Str(s),
-                            CV::Function(idx) => RuntimeValue::Function(idx),
-                            CV::NativeFunction(idx) => RuntimeValue::NativeFunction(idx),
-                            CV::Struct(idx) => RuntimeValue::Struct(idx),
-                            CV::Type(t) => RuntimeValue::Type(t),
-                            other => panic!("LoadConst: unsupported const variant at runtime: {:?}", other),
-                        };
-                    }
-                    x if x == Opcode::NewStruct as u32 => {
-                        let const_val = proto.ctx.consts.get(bx)
-                            .cloned()
-                            .or_else(|| self.consts.get(bx).cloned())
-                            .expect(&format!("NewStruct: OOB bx={}", bx));
+    fn read_reg(&self, base: usize, reg: u32) -> RuntimeValue {
+        self.registers[base + reg as usize].clone()
+    }
+    fn write_reg(&mut self, base: usize, reg: u32, value: RuntimeValue) {
+        self.registers[base + reg as usize] = value;
+    }
 
-                        if let ConstValue::StructInst(struct_idx, concrete_type) = const_val {
-                            let struct_proto = &self.struct_protos[struct_idx];
+    fn close_upvalues(&mut self, from_reg: usize) {
+        for cell in &self.open_upvalues {
+            let should_close = match *cell.0.borrow() {
+                UpvalueCellInner::Open(reg) if reg >= from_reg => true,
+                _ => false,
+            };
+            if should_close {
+                let reg = match *cell.0.borrow() {
+                    UpvalueCellInner::Open(r) => r,
+                    _ => unreachable!(),
+                };
+                let value = self.registers[reg].clone();
+                cell.close(value);
+            }
+        }
+        self.open_upvalues.retain(|cell| {
+            matches!(*cell.0.borrow(), UpvalueCellInner::Open(_))
+        });
+    }
 
-                            let instance = StructInstance {
-                                struct_idx,
-                                concrete_type: concrete_type.clone(),
-                                fields: vec![RuntimeValue::Empty; struct_proto.fields.len()],
-                            };
+    fn current_proto_name(&self) -> &str {
+        let frame = self.call_stack.last().expect("empty call stack");
+        &self.protos[frame.closure.proto_idx].name
+    }
 
-                            let stack_idx = self.stack.len();
-                            self.stack.push(StackSlot::Struct(instance));
+    fn run(&mut self) -> RuntimeValue {
+        loop {
+            let (proto_idx, pc, base_reg, return_reg) = {
+                let f = self.call_stack.last().expect("empty call stack");
+                (f.closure.proto_idx, f.pc, f.base_reg, f.return_reg)
+            };
 
-                            let struct_name = struct_proto.name.clone();
-                            frame.regs[a] = RuntimeValue::Ptr(
-                                VType::Struct(struct_name, concrete_type.clone()),
-                                stack_idx,
-                                false
-                            );
-                        } else {
-                            panic!("NewStruct: expected StructInst, got {:?}", const_val);
-                        }
-                    }
+            let instr = self.protos[proto_idx].code[pc];
+            self.call_stack.last_mut().unwrap().pc += 1;
 
-                    x if x == Opcode::StoreStructField as u32 => {
-                        let raw_value = move_value(&mut frame.regs[c]);
-                        
-                        let stack_idx = match &frame.regs[a] {
-                            RuntimeValue::Ptr(VType::Struct(_, _), idx, false) => *idx,
-                            other => panic!("StoreStructField: not a struct pointer: {:?}", other),
-                        };
+            let op = instr & 0x3F;
 
-                        // Take the struct out of the stack temporarily
-                        let mut s = match std::mem::replace(&mut self.stack[stack_idx], StackSlot::Empty) {
-                            StackSlot::Struct(s) => s,
-                            _ => panic!("StoreStructField: not a struct"),
-                        };
-
-                        let struct_idx = s.struct_idx;
-                        let struct_proto = &self.struct_protos[struct_idx];
-                        let (_, proto_ty) = &struct_proto.fields[b];
-
-                        let field_type = resolve_type(proto_ty, &s.concrete_type, &struct_proto.generics);
-                        let value = cast_value(raw_value, &field_type, &mut self.stack);
-
-                        s.fields[b] = value;
-                        self.stack[stack_idx] = StackSlot::Struct(s);
-                    }
-
-                    x if x == Opcode::LoadStructField as u32 => {
-                        assert_not_moved(&frame.regs[b]);
-                        let stack_idx = match &self.frames[top_idx].regs[b] {
-                            RuntimeValue::Ptr(VType::Struct(..), idx, false) => *idx,
-                            other => panic!("LoadStructField: not a struct pointer: {:?}", other),
-                        };
-                        // frame borrow ends here ^
-                        let val = match self.stack.get_mut(stack_idx) {
-                            Some(StackSlot::Struct(s)) => {
-                                if c >= s.fields.len() { panic!("LoadStructField: field OOB {}", c); }
-                                let val = s.fields[c].clone();
-                                val
-                            }
-                            _ => panic!("LoadStructField: stack slot is not a struct"),
-                        };
-                        self.frames[top_idx].regs[a] = val;
-                    }
-                    x if x == Opcode::Move as u32 => {
-                        assert_not_moved(&frame.regs[bx]);
-
-                        let val = frame.regs[bx].clone();
-                        frame.regs[a] = val;
-                    }
-                    x if x == Opcode::Ret as u32 => {
-                        let return_value = if a == 0 {
-                            None
-                        } else {
-                            let ret_reg = a - 1;
-                            if ret_reg >= frame.regs.len() {
-                                panic!("Ret: return register OOB ret_reg={}", ret_reg);
-                            }
-                            Some(move_value(&mut frame.regs[ret_reg]))
-                        };
-                        if let Some(v) = &return_value {
-                            assert_not_moved(v);
-                        }
-                        self.pop_frame_and_propagate(return_value);
-                    }
-                    x if x == Opcode::Call as u32 => {
-                        let num_args = b;
-                        let num_type_args = c;
-                        if a >= frame.regs.len() {
-                            panic!("Call: function register OOB a={}", a);
-                        }
-                        assert_not_moved(&frame.regs[a]);
-
-                        let func_slot = frame.regs[a].clone();
-                        match func_slot {
-                            RuntimeValue::Function(proto_idx) => {
-                                let stack_base = self.stack.len();
-                                let regs = vec![RuntimeValue::Empty; self.frame_regs];
-                                let mut callee_frame = CallFrame {
-                                    proto_index: proto_idx,
-                                    pc: 0,
-                                    regs,
-                                    stack_base,
-                                    local_var_bases: Vec::new()
-                                };
-
-                                for i in 0..num_args {
-                                    let src_idx = a + 1 + i;
-                                    if src_idx >= frame.regs.len() {
-                                        panic!("CALL: caller arg register OOB");
+            if op == Opcode::LOADK as u32 {
+                let (_, a, bx) = unpack_abx(instr);
+                let value = match &self.protos[proto_idx].constants[bx as usize] {
+                    ConstantValue::U8(n)    => RuntimeValue::U8(*n),
+                    ConstantValue::I8(n)    => RuntimeValue::I8(*n),
+                    ConstantValue::U16(n)   => RuntimeValue::U16(*n),
+                    ConstantValue::I16(n)   => RuntimeValue::I16(*n),
+                    ConstantValue::U32(n)   => RuntimeValue::U32(*n),
+                    ConstantValue::I32(n)   => RuntimeValue::I32(*n),
+                    ConstantValue::U64(n)   => RuntimeValue::U64(*n),
+                    ConstantValue::I64(n)   => RuntimeValue::I64(*n),
+                    ConstantValue::F32(n)   => RuntimeValue::F32(*n),
+                    ConstantValue::F64(n)   => RuntimeValue::F64(*n),
+                    ConstantValue::String(s) => RuntimeValue::String(s.clone()),
+                    ConstantValue::NativeFunctionProto(idx) => RuntimeValue::NativeClosure(*idx),
+                    ConstantValue::FunctionProto(idx) => {
+                        let idx = *idx;
+                        let upvalue_descs: Vec<UpvalueDescriptor> =
+                            self.protos[idx].upvalues.clone();
+                        let frame = self.call_stack.last().unwrap();
+                        let mut cells = Vec::new();
+                        for desc in &upvalue_descs {
+                            let cell = match desc.source {
+                                UpvalueSource::ParentRegister(reg) => {
+                                    let abs_reg = frame.base_reg + reg;
+                                    if let Some(existing) = self.open_upvalues.iter()
+                                        .find(|c| matches!(*c.0.borrow(), UpvalueCellInner::Open(r) if r == abs_reg))
+                                    {
+                                        existing.clone()
+                                    } else {
+                                        let cell = UpvalueCell::new_open(abs_reg);
+                                        self.open_upvalues.push(cell.clone());
+                                        cell
                                     }
-                                    callee_frame.regs[i] = move_value(&mut frame.regs[src_idx]);
                                 }
+                                UpvalueSource::ParentUpvalue(uv_idx) => {
+                                    frame.closure.upvalues[uv_idx].clone()
+                                }
+                            };
+                            cells.push(cell);
+                        }
+                        RuntimeValue::Closure(Closure { proto_idx: idx, upvalues: cells })
+                    }
+                    ConstantValue::ClassProto { name, .. } => panic!(
+                        "LOADK: ClassProto '{}' cannot be loaded as a value; use NEWCLASS", name
+                    ),
+                    ConstantValue::Type(t) => RuntimeValue::Type(t.clone()),
+                };
+                self.write_reg(base_reg, a, value);
+            }
 
-                                self.frames.push(callee_frame);
+            else if op == Opcode::MOVE as u32 {
+                let (_, a, b, _) = unpack_abc(instr);
+                let value = self.read_reg(base_reg, b);
+                self.write_reg(base_reg, a, value);
+            }
+
+            else if op == Opcode::GETUPVAL as u32 {
+                let (_, a, b, _) = unpack_abc(instr);
+                let frame = self.call_stack.last().unwrap();
+                let cell  = frame.closure.upvalues[b as usize].clone();
+                let value = match &*cell.0.borrow() {
+                    UpvalueCellInner::Open(reg)   => self.registers[*reg].clone(),
+                    UpvalueCellInner::Closed(val) => val.clone(),
+                };
+                self.write_reg(base_reg, a, value);
+            }
+
+            else if op == Opcode::CALL as u32 {
+                let (_, a, b, _c) = unpack_abc(instr);
+                let nargs = b as usize;
+                let call_base = base_reg + a as usize; // absolute position of callee
+
+                let callee = self.registers[call_base].clone();
+                let args: Vec<RuntimeValue> = (0..nargs)
+                    .map(|i| self.registers[call_base + 1 + i].clone())
+                    .collect();
+
+                match callee {
+                    RuntimeValue::NativeClosure(native_idx) => {
+                        let func = self.native_protos[native_idx].func;
+                        let result = func(args);
+                        self.registers[call_base] = result;
+                    }
+                    RuntimeValue::Closure(closure) => {
+                        // New frame window starts right after the callee slot.
+                        // Args land at new_base+0, new_base+1, ... matching arity.
+                        let new_base = call_base + 1;
+                        for (i, arg) in args.into_iter().enumerate() {
+                            self.registers[new_base + i] = arg;
+                        }
+                        self.call_stack.push(CallFrame {
+                            closure,
+                            pc: 0,
+                            base_reg: new_base,
+                            return_reg: call_base, // result written back to where callee was
+                        });
+                    }
+                    other => panic!("Attempt to call non-callable: {:?}", other),
+                }
+            }
+
+            else if op == Opcode::RET as u32 {
+                let (_, a, b, _) = unpack_abc(instr);
+                let return_value = if b == 0 {
+                    RuntimeValue::Empty
+                } else {
+                    self.read_reg(base_reg, a)
+                };
+                self.close_upvalues(base_reg);
+                self.call_stack.pop();
+                if self.call_stack.is_empty() {
+                    return return_value;
+                }
+                self.registers[return_reg] = return_value;
+            }
+
+            else if op == Opcode::NEWCLASS as u32 {
+                let (_, a, bx) = unpack_abx(instr);
+
+                let (class_name, field_visibility, methods, operators) =
+                    match &self.protos[proto_idx].constants[bx as usize] {
+                        ConstantValue::ClassProto { name, fields, methods, operators } => {
+                            let field_vis = fields.iter().map(|v| *v).collect::<Vec<_>>();
+                            (name.clone(), field_vis, methods.clone(), operators.clone())
+                        }
+                        other => panic!("NEWCLASS: expected ClassProto, got {:?}", other),
+                    };
+
+                let field_count = field_visibility.len();
+
+                let mut method_table = Vec::new();
+                for (proto_idx, is_pub) in methods {
+                    method_table.push((proto_idx, is_pub));
+                }
+
+                let instance = Rc::new(RefCell::new(ClassInstance {
+                    class_name,
+                    field_values: vec![RuntimeValue::Empty; field_count],
+                    field_visibility,
+                    method_table,
+                    operator_table: operators
+                }));
+
+                self.write_reg(base_reg, a, RuntimeValue::Instance(instance));
+            }
+
+            else if op == Opcode::SETFIELD as u32 {
+                let (_, a, b, c) = unpack_abc(instr);
+
+                let value = self.read_reg(base_reg, b);
+                let obj   = self.read_reg(base_reg, a);
+
+                let field_idx = c as usize;
+
+                match obj {
+                    RuntimeValue::Instance(inst) => {
+                        let mut inst = inst.borrow_mut();
+
+                        if field_idx >= inst.field_values.len() {
+                            panic!("SETFIELD: invalid field index {}", field_idx);
+                        }
+
+                        if !inst.field_visibility[field_idx] {
+                            let caller = self.current_proto_name();
+                            if !caller.starts_with(&format!("{}::", inst.class_name)) {
+                                panic!("field #{} is private", field_idx);
                             }
-                            RuntimeValue::NativeFunction(native_idx) => {
-                                let native = self.native_functions.get(native_idx)
-                                    .expect("Invalid native function index")
-                                    .clone();
+                        }
 
-                                let args: Vec<RuntimeValue> = (0..num_args)
-                                    .map(|i| {
-                                        let arg_reg = a + 1 + i;
-                                        frame.regs[arg_reg].clone()
-                                    })
-                                    .collect();
-                                
-                                let type_args: Vec<VType> = (0..num_type_args)
-                                    .map(|i| {
-                                        let type_reg = a + 1 + num_args + i;
-                                        match &frame.regs[type_reg] {
-                                            RuntimeValue::Type(t) => t.clone(),
-                                            other => panic!("expected Type in type arg register, got {:?}", other),
-                                        }
-                                    })
-                                    .collect();
+                        inst.field_values[field_idx] = value;
+                    }
+                    _ => panic!("SETFIELD: expected instance"),
+                }
+            }
 
-                                let ret = (native.func)(RuntimeValue::NativeFunction(native_idx), &args, &type_args);
-                                frame.regs[a] = ret;
+            else if op == Opcode::GETMETHOD as u32 {
+                let (_, a, b, c) = unpack_abc(instr);
+
+                let obj = self.read_reg(base_reg, b);
+                let method_idx = c as usize;
+
+                match obj {
+                    RuntimeValue::Instance(inst) => {
+                        let inst_ref = inst.borrow();
+
+                        if method_idx >= inst_ref.method_table.len() {
+                            panic!("GETMETHOD: invalid method index {}", method_idx);
+                        }
+
+                        let (proto_idx, is_public) = inst_ref.method_table[method_idx];
+
+                        if !is_public {
+                            let caller = self.current_proto_name();
+                            if !caller.starts_with(&format!("{}::", inst_ref.class_name)) {
+                                panic!("method #{} is private", method_idx);
                             }
-                            other => panic!("Call target not a function: {:?}//[{}]{:?}", other, a, frame.regs),
                         }
-                    }
-                    x if x == Opcode::Add as u32
-                        || x == Opcode::Sub as u32
-                        || x == Opcode::Mul as u32
-                        || x == Opcode::Div as u32 => {
-                        if a >= frame.regs.len() || b >= frame.regs.len() || c >= frame.regs.len() {
-                            panic!("Binary op: register OOB a={} b={} c={}", a, b, c);
-                        }
-                        assert_not_moved(&frame.regs[b]);
-                        assert_not_moved(&frame.regs[c]);
 
-                        let left = &frame.regs[b];
-                        let right = &frame.regs[c];
-
-                        let result = match opcode {
-                            x if x == Opcode::Add as u32 => apply_binop!(left, right, +),
-                            x if x == Opcode::Sub as u32 => apply_binop!(left, right, -),
-                            x if x == Opcode::Mul as u32 => apply_binop!(left, right, *),
-                            x if x == Opcode::Div as u32 => apply_binop!(left, right, /),
-                            _ => unreachable!(),
+                        let closure = Closure {
+                            proto_idx,
+                            upvalues: vec![],
                         };
 
-                        frame.regs[a] = result;
+                        self.write_reg(base_reg, a, RuntimeValue::Closure(closure));
+                        self.write_reg(base_reg, a + 1, RuntimeValue::Instance(inst.clone()));
                     }
-                    x if x == Opcode::Eq as u32 => {
-                        // A = target, B = left, C = right
-                        if a >= frame.regs.len() || b >= frame.regs.len() || c >= frame.regs.len() {
-                            panic!("Eq: register OOB a={} b={} c={}", a, b, c);
+                    other => panic!("GETMETHOD: expected instance, got {:?} at {} !!! {:?}", other, base_reg as u32 + b, self.registers),
+                }
+            }
+
+            else if op == Opcode::GETFIELD as u32 {
+                let (_, a, b, c) = unpack_abc(instr);
+
+                let obj = self.read_reg(base_reg, b);
+                let field_idx = c as usize;
+
+                match obj {
+                    RuntimeValue::Instance(inst) => {
+                        let inst_ref = inst.borrow();
+
+                        if field_idx >= inst_ref.field_values.len() {
+                            panic!("GETFIELD: invalid field index {}", field_idx);
                         }
-                        let res = match (&frame.regs[b], &frame.regs[c]) {
-                            (RuntimeValue::I32(l), RuntimeValue::I32(r)) => *l == *r,
-                            (RuntimeValue::U8(l), RuntimeValue::U8(r)) => *l == *r,
-                            (RuntimeValue::U16(l), RuntimeValue::U16(r)) => *l == *r,
-                            (RuntimeValue::U32(l), RuntimeValue::U32(r)) => *l == *r,
-                            (RuntimeValue::I8(l), RuntimeValue::I8(r)) => *l == *r,
-                            (RuntimeValue::I16(l), RuntimeValue::I16(r)) => *l == *r,
-                            (RuntimeValue::Str(l), RuntimeValue::Str(r)) => l == r,
-                            (RuntimeValue::USize(l), RuntimeValue::USize(r)) => l == r,
-                            (RuntimeValue::Empty, RuntimeValue::Empty) => true,
-                            (RuntimeValue::Bool(l), RuntimeValue::Bool(r)) => l == r,
-                            // You can add more cross-type comparisons if needed
-                            _ => false,
-                        };
-                        frame.regs[a] = RuntimeValue::Bool(res);
+
+                        if !inst_ref.field_visibility[field_idx] {
+                            let caller = self.current_proto_name();
+                            if !caller.starts_with(&format!("{}::", inst_ref.class_name)) {
+                                panic!("field #{} is private", field_idx);
+                            }
+                        }
+
+                        let val = inst_ref.field_values[field_idx].clone();
+                        self.write_reg(base_reg, a, val);
                     }
-                    x if x == Opcode::Lt as u32 => {
-                        if a >= frame.regs.len() || b >= frame.regs.len() || c >= frame.regs.len() {
-                            panic!("Lt: register OOB a={} b={} c={}", a, b, c);
-                        }
-                        let res = match (&frame.regs[b], &frame.regs[c]) {
-                            (RuntimeValue::I32(l), RuntimeValue::I32(r)) => l < r,
-                            (RuntimeValue::USize(l), RuntimeValue::USize(r)) => l < r,
-                            // fallthrough / panic for invalid compares could be used instead
-                            _ => panic!("Lt: unsupported operand types: {:?} {:?}", frame.regs[b], frame.regs[c]),
-                        };
-                        frame.regs[a] = RuntimeValue::Bool(res);
-                    }
-                    x if x == Opcode::Le as u32 => {
-                        if a >= frame.regs.len() || b >= frame.regs.len() || c >= frame.regs.len() {
-                            panic!("Le: register OOB a={} b={} c={}", a, b, c);
-                        }
-                        let res = match (&frame.regs[b], &frame.regs[c]) {
-                            (RuntimeValue::I32(l), RuntimeValue::I32(r)) => l <= r,
-                            (RuntimeValue::USize(l), RuntimeValue::USize(r)) => l <= r,
-                            _ => panic!("Le: unsupported operand types: {:?} {:?}", frame.regs[b], frame.regs[c]),
-                        };
-                        frame.regs[a] = RuntimeValue::Bool(res);
-                    }
-                    x if x == Opcode::LNot as u32 => {
-                        // A = target, Bx encodes source register in this encoding; compiler uses pack_i_abx(Opcode::LNot, reg, reg)
-                        // In your code you emitted LNot as pack_i_abx(Opcode::LNot, reg, reg) earlier.
-                        // We'll read source from bx (same as how LoadConst reads).
-                        let src = bx as usize;
-                        if a >= frame.regs.len() || src >= frame.regs.len() {
-                            panic!("LNot: register OOB a={} src={}", a, src);
-                        }
-                        let res = !truthy(&frame.regs[src]);
-                        frame.regs[a] = RuntimeValue::Bool(res);
-                    }
-                    x if x == Opcode::LAnd as u32 => {
-                        // A = target, B = left, C = right
-                        if a >= frame.regs.len() || b >= frame.regs.len() || c >= frame.regs.len() {
-                            panic!("LAnd: register OOB a={} b={} c={}", a, b, c);
-                        }
-                        let res = truthy(&frame.regs[b]) && truthy(&frame.regs[c]);
-                        frame.regs[a] = RuntimeValue::Bool(res);
-                    }
-                    x if x == Opcode::LOr as u32 => {
-                        if a >= frame.regs.len() || b >= frame.regs.len() || c >= frame.regs.len() {
-                            panic!("LOr: register OOB a={} b={} c={}", a, b, c);
-                        }
-                        let res = truthy(&frame.regs[b]) || truthy(&frame.regs[c]);
-                        frame.regs[a] = RuntimeValue::Bool(res);
-                    }
-                    x if x == Opcode::Jmp as u32 => {
-                        // A = cond reg, Bx = target ip
-                        let cond_reg = a;
-                        let target = bx as usize;
-                        if cond_reg >= frame.regs.len() {
-                            panic!("Jmp: cond reg OOB a={}", cond_reg);
-                        }
-                        if truthy(&frame.regs[cond_reg]) {
-                            frame.pc = target;
-                        }
-                    }
-                    x if x == Opcode::Jn as u32 => {
-                        // A = cond reg, Bx = target ip
-                        let cond_reg = a;
-                        let target = bx as usize;
-                        if cond_reg >= frame.regs.len() {
-                            panic!("Jn: cond reg OOB a={}", cond_reg);
-                        }
-                        if !truthy(&frame.regs[cond_reg]) {
-                            frame.pc = target;
-                        }
-                    }
-                    x if x == Opcode::BeginBlock as u32 => {
-                        let current_stack_size = self.stack.len();
-                        self.block_stack_bases.push(current_stack_size);
-                        
-                        let idx = self.frames.len() - 1;
-                        let frame = &mut self.frames[idx];
-                        
-                        let mut local_base = frame.regs.len() - 1;
-                        frame.local_var_bases.push(local_base);
-                    }
+                    _ => panic!("GETFIELD: expected instance"),
+                }
+            }
+
+            else if op == Opcode::ADD as u32
+                 || op == Opcode::SUB as u32
+                 || op == Opcode::MUL as u32
+                 || op == Opcode::DIV as u32
+                 || op == Opcode::MOD as u32
+                 || op == Opcode::POW as u32
+                 || op == Opcode::BLSHIFT as u32
+                 || op == Opcode::BRSHIFT as u32
+                 || op == Opcode::BNOT as u32
+                 || op == Opcode::BAND as u32
+                 || op == Opcode::BOR as u32
+                 || op == Opcode::LNOT as u32
+                 || op == Opcode::LOR as u32
+                 || op == Opcode::LAND as u32
+                 || op == Opcode::EQ as u32
+                 || op == Opcode::NEQ as u32
+                 || op == Opcode::LT as u32
+                 || op == Opcode::GT as u32
+                 || op == Opcode::LE as u32
+                 || op == Opcode::GE as u32
+            {
+                let (_, a, b, c) = unpack_abc(instr);
+                let lhs = self.read_reg(base_reg, b);
+                let rhs = self.read_reg(base_reg, c);
+                let result = RuntimeValue::arith(&lhs, &rhs, op);
+                self.write_reg(base_reg, a, result);
+            }
+
+            else if op == Opcode::ADDOV as u32
+                 || op == Opcode::SUBOV as u32
+                 || op == Opcode::MULOV as u32
+                 || op == Opcode::DIVOV as u32
+                 || op == Opcode::MODOV as u32
+                 || op == Opcode::POWOV as u32
+                 || op == Opcode::BLSHIFTOV as u32
+                 || op == Opcode::BRSHIFTOV as u32
+                 || op == Opcode::BNOTOV as u32
+                 || op == Opcode::BANDOV as u32
+                 || op == Opcode::BOROV as u32
+                 || op == Opcode::LNOTOV as u32
+                 || op == Opcode::LOROV as u32
+                 || op == Opcode::LANDOV as u32
+                 || op == Opcode::EQOV as u32
+                 || op == Opcode::NEQOV as u32
+                 || op == Opcode::LTOV as u32
+                 || op == Opcode::GTOV as u32
+                 || op == Opcode::LEOV as u32
+                 || op == Opcode::GEOV as u32
+            {
+                let (_, a, b, c) = unpack_abc(instr);
+                let call_base = base_reg + a as usize;
+
+                let operator  =
+                    if op == Opcode::ADDOV as u32 {Operator::Add}
+                    else if op == Opcode::SUBOV as u32 {Operator::Sub}
+                    else if op == Opcode::DIVOV as u32 {Operator::Div}
+                    else if op == Opcode::MULOV as u32 {Operator::Mul}
+                    else {panic!("Unknown operator: {:?}", op)};
                     
-                    x if x == Opcode::EndBlock as u32 => {
-                        if let Some(block_base) = self.block_stack_bases.pop() {
-                            self.cleanup_stack(block_base);
-                        } else {
-                            panic!("EndBlock without matching BeginBlock");
-                        }
-                        
-                        let idx = self.frames.len() - 1;
-                        let frame = &mut self.frames[idx];
-                        if let Some(local_base) = frame.local_var_bases.pop() {
-                            for i in local_base..frame.regs.len() - 1 {
-                                frame.regs[i] = RuntimeValue::Empty;
-                            }
-                        } else {
-                            panic!("EndBlock without matching BeginBlock for locals");
-                        }
-                    }
-                    x if x == Opcode::Cast as u32 => {
-                        let const_val = proto.ctx.consts.get(bx)
-                            .cloned()
-                            .or_else(|| self.consts.get(bx).cloned())
-                            .expect(&format!("Cast: OOB bx={}", bx));
-                        let target_type = if let ConstValue::Type(t) = const_val {
-                            t
-                        } else {
-                            panic!("Cast: not a Type const at {}", bx);
-                        };
+                let lhs = self.read_reg(base_reg, b);
+                let rhs = self.read_reg(base_reg, c);
 
-                        match (&frame.regs[a].clone(), &target_type) {
-                            (RuntimeValue::Ptr(VType::Array(_), stack_idx, _), VType::Array(to_elem)) => {
-                                let stack_idx = *stack_idx;
-                                let to_elem = *to_elem.clone();
+                let closure = match &lhs {
+                    RuntimeValue::Instance(inst_rc) => {
+                        let inst = inst_rc.borrow();
 
-                                // Take ownership of the elements vector
-                                let old_elems = match std::mem::replace(
-                                    &mut self.stack[stack_idx],
-                                    StackSlot::Array(Vec::new()),
-                                ) {
-                                    StackSlot::Array(v) => v,
-                                    _ => panic!("Ptr does not point to an array at stack index {}", stack_idx),
-                                };
+                        let proto_idx = *inst.operator_table
+                            .get(&operator)
+                            .expect("No operator overload");
 
-                                // Recursively cast each element
-                                let new_elems: Vec<RuntimeValue> = old_elems
-                                    .into_iter()
-                                    .map(|v| cast_value(v, &to_elem, &mut self.stack))
-                                    .collect();
-
-                                // Put the array back into the stack
-                                self.stack[stack_idx] = StackSlot::Array(new_elems);
-
-                                frame.regs[a] = RuntimeValue::Ptr(target_type, stack_idx, false);
-                            }
-                            _ => {
-                                let src = frame.regs[a].clone();
-                                frame.regs[a] = cast_value(src, &target_type, &mut self.stack);
-                            }
+                        Closure {
+                            proto_idx,
+                            upvalues: vec![],
                         }
                     }
+                    _ => panic!("No operator overload"),
+                };
 
-                    x if x == Opcode::NewArray as u32 => {
-                        let const_val = proto.ctx.consts.get(bx)
-                            .cloned()
-                            .or_else(|| self.consts.get(bx).cloned())
-                            .expect(&format!("NewArray: OOB bx={}", bx));
+                self.registers[call_base] = RuntimeValue::Closure(closure.clone());
+                self.registers[call_base + 1] = lhs;
+                self.registers[call_base + 2] = rhs;
 
-                        let elem_type = if let ConstValue::Array(elem) = const_val {
-                            *elem
-                        } else {
-                            panic!("NewArray: constant at index {} is not Array, got {:?}", bx, const_val);
-                        };
+                self.call_stack.push(CallFrame {
+                    closure,
+                    pc: 0,
+                    base_reg: call_base + 1,
+                    return_reg: base_reg + a as usize,
+                });
+            }
 
-                        let stack_idx = self.stack.len();
-                        self.stack.push(StackSlot::Array(Vec::new()));
-                        frame.regs[a] = RuntimeValue::Ptr(VType::Array(Box::new(elem_type)), stack_idx, false);
-                    }
+            else if op == Opcode::TYCAST as u32 {
+                let (_, a, b, c) = unpack_abc(instr);
+                let src = self.read_reg(base_reg, b);
+                let target_ty = match &self.protos[proto_idx].constants[c as usize] {
+                    ConstantValue::Type(t) => t.clone(),
+                    other => panic!("TYCAST: expected Type constant, got {:?}", other),
+                };
+                let result = Self::tycast(src, &target_ty);
+                self.write_reg(base_reg, a, result);
+            }
 
-                    x if x == Opcode::GetArrayIdx as u32 => {
-                        assert_not_moved(&frame.regs[b]);
-                        
-                        let idx = match &frame.regs[c] {
-                            RuntimeValue::USize(n) => *n,
-                            RuntimeValue::I32(n) if *n >= 0 => *n as usize,
-                            other => panic!("GetArrayIdx: bad index: {:?}", other),
-                        };
-                        let stack_idx = match &frame.regs[b] {
-                            RuntimeValue::Ptr(VType::Array(..), i, false) => *i,
-                            other => panic!("GetArrayIdx: not an array ptr: {:?}", other),
-                        };
-                        let val = match self.stack.get_mut(stack_idx) {
-                            Some(StackSlot::Array(elems)) => {
-                                if idx >= elems.len() { panic!("GetArrayIdx: OOB {} len={}", idx, elems.len()); }
-                                elems[idx].clone()
-                            }
-                            _ => panic!("GetArrayIdx: stack slot is not an array"),
-                        };
-                        frame.regs[a] = val;
-                    }
-
-                    x if x == Opcode::SetArrayIdx as u32 => {
-                        assert_not_moved(&frame.regs[b]);
-
-                        let idx = match &frame.regs[c] {
-                            RuntimeValue::USize(n) => *n,
-                            RuntimeValue::I32(n) if *n >= 0 => *n as usize,
-                            other => panic!("SetArrayIdx: bad index: {:?}", other),
-                        };
-                        let value = move_value(&mut frame.regs[c]);
-                        let stack_idx = match &frame.regs[a] {
-                            RuntimeValue::Ptr(VType::Array(..), i, false) => *i,
-                            other => panic!("SetArrayIdx: not an array ptr: {:?}", other),
-                        };
-                        match self.stack.get_mut(stack_idx) {
-                            Some(StackSlot::Array(elems)) => {
-                                if idx >= elems.len() {
-                                    elems.push(value);
-                                } else {
-                                    elems[idx] = value;
-                                }
-                            }
-                            _ => panic!("SetArrayIdx: stack slot is not an array"),
-                        }
-                    }
-                    x if x == Opcode::ArrayLen as u32 => {
-                        let stack_idx = match &frame.regs[a] {
-                            RuntimeValue::Ptr(VType::Array(..), i, _) => *i,
-                            other => panic!("ArrayLen: not an array ptr: {:?}", other),
-                        };
-                        let len = match self.stack.get(stack_idx) {
-                            Some(StackSlot::Array(elems)) => elems.len(),
-                            _ => panic!("ArrayLen: stack slot is not an array"),
-                        };
-                        frame.regs[bx] = RuntimeValue::USize(len);
-                    }
-                    _ => {
-                        panic!("Unknown opcode {} in proto {}", opcode, frame.proto_index);
-                    }
-                }
+            else {
+                panic!("Unknown opcode: {}", op);
             }
         }
     }
 
-    fn push_frame(&mut self, proto_index: usize) -> usize {
-        let stack_base = self.stack.len();  // Current stack size becomes this frame's base
-        let regs = vec![RuntimeValue::Empty; self.frame_regs];
-        let frame = CallFrame { 
-            proto_index, 
-            pc: 0, 
-            regs, 
-            stack_base,
-            local_var_bases: Vec::new()
-        };
-        let len = self.frames.len();
-        self.frames.push(frame);
-        len
-    }
-
-    /// Pop the top frame and propagate its return value to the caller.
-    /// Clean up all stack-allocated structs from this frame.
-    fn pop_frame_and_propagate(&mut self, ret: Option<RuntimeValue>) {
-        let callee = self.frames.pop().expect("pop_frame on empty stack");
-
-        let is_top_level = self.frames.is_empty();
-
-        // Clean up all structs allocated in this frame
-        self.cleanup_stack(callee.stack_base);
-
-        let return_val = if is_top_level {
-            // No caller => no pointer check
-            ret.or_else(|| callee.regs.get(0).cloned())
-        } else {
-            // Caller exists => run validity check
-            ret.or_else(|| {
-                match callee.regs.get(0) {
-                    Some(RuntimeValue::Ptr(other, stack_idx, moved)) => {
-                        if *stack_idx > callee.stack_base {
-                            println!("Warning: returning invalid struct pointer");
-                            Some(RuntimeValue::Empty)
-                        } else {
-                            Some(RuntimeValue::Ptr(other.clone(), *stack_idx, *moved))
-                        }
-                    }
-                    Some(other) => Some(other.clone()),
-                    None => Some(RuntimeValue::Empty),
-                }
-            })
-        };
-
-        if let Some(caller) = self.frames.last_mut() {
-            let callee_proto_idx = callee.proto_index;
-            let target_reg = caller.regs.iter().position(|rv|
-                matches!(rv, RuntimeValue::Function(idx) if *idx == callee_proto_idx)
-            );
-
-            if let Some(ridx) = target_reg {
-                caller.regs[ridx] = return_val.unwrap_or(RuntimeValue::Empty);
-            } else {
-                caller.regs[0] = return_val.unwrap_or(RuntimeValue::Empty);
-            }
+    /// Numeric type cast at runtime.
+    fn tycast(src: RuntimeValue, target: &Type) -> RuntimeValue {
+        let n = src.as_f64();
+        match target {
+            Type::U8    => RuntimeValue::U8(n as u8),
+            Type::I8    => RuntimeValue::I8(n as i8),
+            Type::U16   => RuntimeValue::U16(n as u16),
+            Type::I16   => RuntimeValue::I16(n as i16),
+            Type::U32   => RuntimeValue::U32(n as u32),
+            Type::I32   => RuntimeValue::I32(n as i32),
+            Type::U64   => RuntimeValue::U64(n as u64),
+            Type::I64   => RuntimeValue::I64(n as i64),
+            other => panic!("TYCAST: unsupported target type {:?}", other),
         }
-    }
-}
-
-fn truthy(rv: &RuntimeValue) -> bool {
-    match rv {
-        RuntimeValue::Bool(b) => *b,
-        RuntimeValue::Empty => false,
-        other => true
     }
 }

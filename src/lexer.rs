@@ -16,12 +16,11 @@ pub enum Token<'a> {
 
     BINOP(&'a str),
     UNARY(&'a str),
-
     PAREN(&'a str),
+    AND,
 
     DECLARE,
-    STRUCT,
-    IMPL,
+    CLASS,
     IDENT(&'a str),
 
     FN,
@@ -45,8 +44,18 @@ pub enum Token<'a> {
     IMPORT,
     USE,
 
+    STATIC,
+    DYNAMIC,
+
     WHEN,
     AS,
+
+    MUTABLE,
+
+    SELF,
+    SELFTYPE,
+
+    OPERATOR,
 }
 
 static KEYWORDS: OnceLock<HashMap<&'static str, Token<'static>>> = OnceLock::new();
@@ -55,10 +64,10 @@ static KEYWORDS: OnceLock<HashMap<&'static str, Token<'static>>> = OnceLock::new
 fn keywords() -> &'static HashMap<&'static str, Token<'static>> {
     KEYWORDS.get_or_init(|| {
         let mut map = HashMap::new();
-        map.insert("let", Token::DECLARE);
-        map.insert("fun", Token::FN);
+        map.insert("local", Token::DECLARE);
+        map.insert("function", Token::FN);
         map.insert("return", Token::RETURN);
-        map.insert("struct", Token::STRUCT);
+        map.insert("class", Token::CLASS);
         map.insert("if", Token::IF);
         map.insert("else", Token::ELSE);
         map.insert("elseif", Token::ELSEIF);
@@ -67,12 +76,17 @@ fn keywords() -> &'static HashMap<&'static str, Token<'static>> {
         map.insert("do", Token::DO);
         map.insert("end", Token::END);
         map.insert("in", Token::IN);
-        map.insert("pub", Token::PUB);
+        map.insert("public", Token::PUB);
         map.insert("import", Token::IMPORT);
+        map.insert("dynamic", Token::DYNAMIC);
+        map.insert("static", Token::STATIC);
         map.insert("use", Token::USE);
         map.insert("when", Token::WHEN);
-        map.insert("impl", Token::IMPL);
+        map.insert("mut", Token::MUTABLE);
+        map.insert("operator", Token::OPERATOR);
         map.insert("as", Token::AS);
+        map.insert("self", Token::SELF);
+        map.insert("Self", Token::SELFTYPE);
         map
     })
 }
@@ -82,9 +96,9 @@ pub fn tokenize(src: String) -> Vec<Token<'static>> {
     let mut chars = src.chars().peekable();
 
     let keywords = keywords();
-    let mut prev: Option<Token> = None;
-
+    
     while let Some(mut char) = chars.next() {
+        let prev = tokens.last().cloned();
         if char == '"' || char == '\'' {
             let quote_char = char;
             let mut string_lit = String::new();
@@ -184,16 +198,6 @@ pub fn tokenize(src: String) -> Vec<Token<'static>> {
 
                 tokens.push(Token::FMTSTRING(Box::leak(s.into_boxed_str())));
             }
-            '#' => {
-                while let Some(&next_char) = chars.peek() {
-                    if next_char == '\n' {
-                        chars.next();
-                        break;
-                    }
-                    chars.next();
-                }
-                continue;
-            }
             '+' => {
                 if chars.peek().map_or(false, |c| c == &'=') {
                     tokens.push(Token::BINOP("+="));
@@ -203,6 +207,41 @@ pub fn tokenize(src: String) -> Vec<Token<'static>> {
                 }
             }
             '-' => {
+                if chars.peek().map_or(false, |c| c == &'-') {
+                    chars.next(); // consume second '-'
+
+                    // Block comment: --[[ ... ]]
+                    if chars.peek().map_or(false, |c| c == &'[') {
+                        chars.next(); // consume '['
+
+                        if chars.peek().map_or(false, |c| c == &'[') {
+                            chars.next(); // consume second '['
+
+                            // consume until ]]
+                            while let Some(_) = chars.next() {
+                                if let Some(']') = chars.peek() {
+                                    chars.next();
+                                    if chars.peek().map_or(false, |c| c == &']') {
+                                        chars.next();
+                                        break;
+                                    }
+                                }
+                            }
+
+                            continue;
+                        }
+                    }
+
+                    // Line comment: -- ...
+                    while let Some(c) = chars.next() {
+                        if c == '\n' {
+                            break;
+                        }
+                    }
+
+                    continue;
+                }
+                
                 if chars.peek().map_or(false, |c| c == &'>') {
                     tokens.push(Token::ARROW);
                     chars.next();
@@ -220,13 +259,14 @@ pub fn tokenize(src: String) -> Vec<Token<'static>> {
                         | Some(Token::PUNCT(",")) => true,
                         _ => false,
                     };
+
                     if unary {
                         tokens.push(Token::UNARY("-"));
                     } else {
                         tokens.push(Token::BINOP("-"));
                     }
                 }
-            }
+            },
             '!' => {
                 if chars.peek().map_or(false, |c| c == &'=') {
                     tokens.push(Token::BINOP("!="));
@@ -254,7 +294,12 @@ pub fn tokenize(src: String) -> Vec<Token<'static>> {
                 if chars.peek().map_or(false, |c| c == &'=') {
                     tokens.push(Token::BINOP("*="));
                     chars.next();
-                } else {
+                }
+                else if chars.peek().map_or(false, |c| c == &'>') {
+                    tokens.push(Token::BINOP("*>"));
+                    chars.next();
+                }
+                else {
                     tokens.push(Token::BINOP("*"));
                 }
             }
@@ -324,6 +369,16 @@ pub fn tokenize(src: String) -> Vec<Token<'static>> {
             ']' => tokens.push(Token::PAREN("]")),
 
             '<' => {
+                if chars.peek().map_or(false, |c| c == &'<') {
+                    chars.next();
+                    if chars.peek().map_or(false, |c| c == &'=') {
+                        tokens.push(Token::BINOP("<<="));
+                        chars.next();
+                    } else {
+                        tokens.push(Token::BINOP("<<"));
+                    }
+                    continue;
+                }
                 if chars.peek().map_or(false, |c| c == &'=') {
                     tokens.push(Token::BINOP("<="));
                     chars.next();
@@ -339,17 +394,17 @@ pub fn tokenize(src: String) -> Vec<Token<'static>> {
                 }
             }
             '>' => {
-                // if chars.peek().map_or(false, |c| c == &'>') {
-                //     chars.next();
-                //     if chars.peek().map_or(false, |c| c == &'=') {
-                //         tokens.push(Token::BINOP(">>="));
-                //         chars.next();
-                //     } else {
-                //         tokens.push(Token::BINOP(">>"));
-                //     }
-                //     continue;
-                // }
-                // else
+                if chars.peek().map_or(false, |c| c == &'>') {
+                    chars.next();
+                    if chars.peek().map_or(false, |c| c == &'=') {
+                        tokens.push(Token::BINOP(">>="));
+                        chars.next();
+                    } else {
+                        tokens.push(Token::BINOP(">>"));
+                    }
+                    continue;
+                }
+                else
                 if chars.peek().map_or(false, |c| c == &'=') {
                     tokens.push(Token::BINOP(">="));
                     chars.next();
@@ -369,13 +424,11 @@ pub fn tokenize(src: String) -> Vec<Token<'static>> {
                         tokens.push(Token::BINOP("&&"));
                     }
                     continue;
-                }
-                else if chars.peek().map_or(false, |c| c == &'=') {
+                } else if chars.peek().map_or(false, |c| c == &'=') {
                     tokens.push(Token::BINOP("&="));
                     chars.next();
-                }
-                else {
-                    tokens.push(Token::BINOP("&"))
+                } else {
+                    tokens.push(Token::AND);
                 }
             }
             '|' => {
@@ -398,10 +451,6 @@ pub fn tokenize(src: String) -> Vec<Token<'static>> {
                 }
             }
             _ => {}
-        }
-
-        if let Some(last) = tokens.last() {
-            prev = Some(last.clone());
         }
     }
 
